@@ -1,6 +1,11 @@
 import json
 import os
+import random
+import time
 import requests
+from datetime import datetime, timedelta
+from typing import List, Dict, Optional, Union, Tuple
+from trade_simulator import simulate_recommended_trades
 from datetime import datetime, date, timedelta
 from typing import List, Dict, Any, Optional, Tuple
 
@@ -37,22 +42,25 @@ MIN_STRIKE_PCT = 0.90  # 10% below current price for puts
 MAX_STRIKE_PCT = 1.10  # 10% above current price for calls
 MIN_DELTA = 0.10       # Minimum delta for options (wider range)
 MAX_DELTA = 0.50       # Maximum delta for options (wider range)
-MIN_PREMIUM = 0.10     # Lower minimum premium to see more options
+MIN_PREMIUM = 0.50     # Minimum premium per contract in $
 
-# Options filtering parameters
-MIN_OPEN_INTEREST = 50     # Minimum open interest to ensure liquidity
-MIN_VOLUME = 0             # Allow options with any volume, rely more on OI
-STRIKE_PRICE_RANGE = 0.40  # 40% range around current price
+# Yield & Premium
+MIN_ANNUALIZED_YIELD = 20.0  # Minimum annualized yield in %
+MIN_ROC = 2.0  # Minimum return on capital in % per month
 
-# Delta ranges for filtering
-PUT_MIN_DELTA = 0.10     # Minimum delta for puts
-PUT_MAX_DELTA = 0.50     # Maximum delta for puts
-CALL_MIN_DELTA = 0.10    # Minimum delta for calls
-CALL_MAX_DELTA = 0.90    # Maximum delta for calls (increased from 0.7)
+# Probability & Risk
+MIN_PROBABILITY_ITM = 65.0  # Minimum probability ITM in %
+MAX_BID_ASK_SPREAD_PCT = 10.0  # Maximum bid-ask spread as % of mid price
 
-# Premium and yield thresholds
-MIN_PREMIUM = 0.10       # Minimum premium to filter out penny options
-MIN_ANNUALIZED_YIELD = 10.0  # Minimum annualized yield percentage
+# Greeks Filtering
+PUT_MIN_DELTA = 0.20  # 20 delta puts
+PUT_MAX_DELTA = 0.35  # 35 delta puts
+CALL_MIN_DELTA = 0.20  # 20 delta calls
+CALL_MAX_DELTA = 0.35  # 35 delta calls
+
+# Volume and Open Interest
+MIN_OPEN_INTEREST = 100  # Minimum open interest
+MIN_VOLUME = 50  # Minimum daily volume
 
 # Output formatting
 PRICE_WIDTH = 8
@@ -61,6 +69,9 @@ YIELD_WIDTH = 8
 DELTA_WIDTH = 8
 EXPIRY_WIDTH = 12
 OUTPUT_FILE = 'options_analysis.md'  # Output markdown file
+
+# Strike price range for options chain (as a percentage of current price)
+STRIKE_PRICE_RANGE = 0.30  # 30% range around current price
 
 def get_market_status():
     """Check if the market is currently open"""
@@ -178,17 +189,19 @@ def get_stock_price(ticker):
         print(f"Unexpected error getting price for {ticker}: {str(e)}")
         return None
 
-def get_options_chain(ticker, option_type, current_price):
+def get_options_chain(ticker, option_type, current_price, max_retries=5, initial_delay=2):
     """
-    Get options chain for a given ticker and option type with enhanced error handling.
+    Get options chain for a given ticker and option type with enhanced error handling and retries.
     
     Args:
         ticker (str): Stock ticker symbol
         option_type (str): 'put' or 'call'
         current_price (float): Current stock price
+        max_retries (int): Maximum number of retry attempts
+        initial_delay (int): Initial delay between retries in seconds
         
     Returns:
-        list: List of option contracts with details and pricing
+        list: List of option contracts with details and pricing, or empty list on failure
     """
     if not API_KEY or API_KEY == 'YOUR_API_KEY_HERE':
         print("⚠️  Please set your Polygon.io API key in the environment variable POLYGON_API_KEY")
@@ -208,64 +221,120 @@ def get_options_chain(ticker, option_type, current_price):
     
     print(f"Fetching {option_type} options with strikes ${min_strike:.2f} to ${max_strike:.2f}...")
     
-    try:
-        # First, get the list of all option contracts for this ticker and expiration
-        url = f"{BASE_URL}/v3/reference/options/contracts"
-        params = {
-            'underlying_ticker': ticker.upper(),
-            'contract_type': option_type.lower(),
-            'expiration_date': TARGET_EXPIRATION,
-            'apiKey': API_KEY,
-            'limit': 1000,  # Maximum allowed by Polygon
-            'as_of': 'trades',  # Get the most recent data
-            'sort': 'strike_price',
-            'order': 'asc'
-        }
-        
-        print(f"Requesting options chain from {url}...")
-        response = requests.get(url, params=params, headers=HEADERS, timeout=15)
-        response.raise_for_status()
-        
-        data = response.json()
-        
-        if 'results' not in data or not data['results']:
-            print(f"No {option_type} options found for {ticker} (exp: {TARGET_EXPIRATION})")
-            return []
-        print(f"Found {len(data['results'])} {option_type} contracts for {ticker}")
-        return data['results']
-            
-    except requests.exceptions.HTTPError as http_err:
-        status_code = http_err.response.status_code if hasattr(http_err, 'response') else 'Unknown'
-        print(f"\n❌ HTTP {status_code} error fetching {option_type} options for {ticker}:")
-        
-        # Handle rate limiting
-        if status_code == 429:
-            print("Rate limit exceeded. Please wait before making more requests.")
-            retry_after = http_err.response.headers.get('Retry-After', '60')
-            print(f"Please wait {retry_after} seconds before trying again.")
-        # Handle authentication errors
-        elif status_code in [401, 403]:
-            print("Authentication failed. Please check your API key.")
-            print("You can get a free API key at https://polygon.io/")
-            print(f"Current API key: {'*' * 8}{API_KEY[-4:] if API_KEY else 'None'}")
-        
-        # Print response details if available
+    # Prepare request parameters
+    url = f"{BASE_URL}/v3/reference/options/contracts"
+    params = {
+        'underlying_ticker': ticker.upper(),
+        'contract_type': option_type.lower(),
+        'expiration_date': TARGET_EXPIRATION,
+        'apiKey': API_KEY,
+        'limit': 1000,  # Maximum allowed by Polygon
+        'as_of': 'trades',  # Get the most recent data
+        'sort': 'strike_price',
+        'order': 'asc'
+    }
+    
+    # Implement retry logic with exponential backoff
+    for attempt in range(max_retries + 1):
         try:
-            error_details = http_err.response.json()
-            print(f"Error details: {error_details}")
-        except:
-            error_text = http_err.response.text[:500] if hasattr(http_err.response, 'text') else 'No details'
-            print(f"Response: {error_text}")
+            if attempt > 0:
+                # Calculate exponential backoff delay with jitter
+                delay = min(initial_delay * (2 ** (attempt - 1)) + (random.uniform(0, 1)), 30)  # Cap at 30 seconds
+                print(f"⏳ Retry attempt {attempt}/{max_retries} in {delay:.1f} seconds...")
+                time.sleep(delay)
             
-    except requests.exceptions.RequestException as req_err:
-        print(f"\n❌ Request error fetching {option_type} options for {ticker}:")
-        print(f"Error: {str(req_err)}")
-        
-    except Exception as e:
-        print(f"\n❌ Unexpected error fetching {option_type} options for {ticker}:")
-        print(f"Error: {str(e)}")
-        import traceback
-        traceback.print_exc()
+            # Print detailed request info for debugging
+            print(f"\n🔍 Request #{attempt + 1} for {ticker} {option_type.upper()} options:")
+            print(f"   URL: {url}")
+            print(f"   Params: { {k: v for k, v in params.items() if k != 'apiKey'} }")
+            
+            start_time = time.time()
+            response = requests.get(url, params=params, headers=HEADERS, timeout=15)
+            response_time = time.time() - start_time
+            
+            print(f"✅ Response received in {response_time:.2f}s (Status: {response.status_code})")
+            
+            # Check for rate limiting headers
+            if 'X-RateLimit-Requests-Remaining' in response.headers:
+                remaining = response.headers['X-RateLimit-Requests-Remaining']
+                limit = response.headers.get('X-RateLimit-Requests-Limit', 'unknown')
+                print(f"   Rate limit: {remaining}/{limit} requests remaining")
+            
+            response.raise_for_status()
+            
+            data = response.json()
+            
+            # Check if we got a valid response
+            if 'status' in data and data['status'] == 'ERROR':
+                error_msg = data.get('error', 'Unknown error from Polygon API')
+                print(f"❌ API Error: {error_msg}")
+                if attempt == max_retries:
+                    return []
+                continue
+            
+            if 'results' not in data:
+                print(f"❌ Unexpected response format from API: {data}")
+                if attempt == max_retries:
+                    return []
+                continue
+                
+            if not data['results']:
+                print(f"ℹ️  No {option_type} options found for {ticker} (exp: {TARGET_EXPIRATION})")
+                return []
+                
+            print(f"✅ Found {len(data['results'])} {option_type} contracts for {ticker}")
+            return data['results']
+            
+        except requests.exceptions.HTTPError as http_err:
+            status_code = http_err.response.status_code if hasattr(http_err, 'response') else 'Unknown'
+            
+            # Log detailed error information
+            print(f"\n❌ HTTP {status_code} Error:")
+            try:
+                error_details = http_err.response.json()
+                print(f"   Error Details: {error_details}")
+            except:
+                error_text = http_err.response.text[:500] if hasattr(http_err.response, 'text') else 'No details'
+                print(f"   Response: {error_text}")
+            
+            # Don't retry on client errors (4xx) except 429 (rate limit) and 502/503/504 (temporary server errors)
+            if 400 <= status_code < 500 and status_code not in [429, 502, 503, 504]:
+                if status_code in [401, 403]:
+                    print("❌ Authentication failed. Please check your API key.")
+                    print("   You can get a free API key at https://polygon.io/")
+                    print(f"   Current API key: {'*' * len(API_KEY) if API_KEY else 'None'}")
+                return []
+                
+            # If we've reached max retries, give up
+            if attempt == max_retries:
+                print(f"\n❌ Max retries ({max_retries}) reached for {option_type} options on {ticker}")
+                if status_code == 429:
+                    retry_after = http_err.response.headers.get('Retry-After', 'unknown')
+                    print(f"   Rate limit exceeded. Please wait {retry_after} seconds before trying again.")
+                return []
+                
+            print(f"\n⚠️  Attempt {attempt + 1} failed with HTTP {status_code}, retrying...")
+            
+        except requests.exceptions.RequestException as req_err:
+            if attempt == max_retries:
+                print(f"\n❌ Max retries reached for {option_type} options on {ticker}")
+                print(f"   Request error: {req_err}")
+                return []
+            print(f"\n⚠️  Request error (attempt {attempt + 1}): {req_err}, retrying...")
+            
+        except json.JSONDecodeError as json_err:
+            print(f"❌ Failed to parse JSON response: {json_err}")
+            if attempt == max_retries:
+                return []
+                
+        except Exception as e:
+            if attempt == max_retries:
+                print(f"\n❌ Max retries reached for {option_type} options on {ticker}")
+                print(f"   Unexpected error: {e}")
+                import traceback
+                traceback.print_exc()
+                return []
+            print(f"\n⚠️  Unexpected error (attempt {attempt + 1}): {e}, retrying...")
     
     return []
 
@@ -580,125 +649,312 @@ def summarize_options(options, current_price, is_put=True):
     
     if not processed_options:
         print("No valid options found after processing")
-        return []
     
     # Filter and sort the options
     return filter_and_sort_options(processed_options, current_price, is_put)
 
-def filter_and_sort_options(options, current_price, is_put=True):
+def filter_and_sort_options(options: List[Dict], current_price: float, is_put: bool = True) -> List[Dict]:
     """
-    Filter and sort options based on criteria with improved filtering and fallback logic.
+    Filter and sort options based on advanced criteria and rank them for potential trades.
     
     Args:
-        options (list): List of option dictionaries with metrics
-        current_price (float): Current stock price
-        is_put (bool, optional): Whether these are put options. Defaults to True.
+        options: List of option dictionaries with pricing and greeks
+        current_price: Current price of the underlying asset
+        is_put: Whether these are put options (True) or call options (False)
         
     Returns:
-        list: Filtered and sorted list of option dictionaries with additional metrics
+        List of filtered and ranked option dictionaries with additional metrics
     """
     if not options:
+        print("No options provided for filtering.")
         return []
     
-    # Adjust delta ranges and strike range based on option type
-    if is_put:
-        min_delta = PUT_MIN_DELTA
-        max_delta = PUT_MAX_DELTA
-        strike_range = STRIKE_PRICE_RANGE
-    else:
-        min_delta = CALL_MIN_DELTA
-        max_delta = CALL_MAX_DELTA
-        strike_range = STRIKE_PRICE_RANGE * 1.2  # Slightly wider strike range for calls
+    filtered = []
     
-    print(f"\n{'='*60}")
-    print(f"FILTERING {'PUT' if is_put else 'CALL'} OPTIONS (Current Price: ${current_price:.2f})")
-    print(f"Delta Range: {min_delta} to {max_delta}")
-    print(f"Strike Price Range: ${current_price * (1 - strike_range):.2f} to ${current_price * (1 + strike_range):.2f}")
-    print(f"Minimum Premium: ${MIN_PREMIUM}")
-    print(f"Minimum Open Interest: {MIN_OPEN_INTEREST}")
-    print(f"Minimum Volume: {MIN_VOLUME}")
-    print(f"Minimum Annualized Yield: {MIN_ANNUALIZED_YIELD}%")
-    print("-"*60)
+    # Set parameters based on option type
+    min_delta = PUT_MIN_DELTA if is_put else CALL_MIN_DELTA
+    max_delta = PUT_MAX_DELTA if is_put else CALL_MAX_DELTA
+    option_type = 'Put' if is_put else 'Call'
     
-    filtered_options = []
+    print(f"\n🔍 Filtering {option_type} options (Δ {min_delta}-{max_delta}):")
     
-    for i, option in enumerate(options[:100]):  # Check more options to find good candidates
-        skip_reason = None
-        
+    for opt in options:
         try:
-            # Calculate moneyness
+            # Skip if missing required fields
+            required_fields = ['strike_price', 'delta', 'mid_price', 'days_to_expiration',
+                             'bid', 'ask', 'open_interest', 'volume']
+            if not all(k in opt for k in required_fields):
+                continue
+            
+            strike = opt['strike_price']
+            delta = abs(opt['delta'])  # Use absolute value for puts
+            
+            # Skip if delta is outside our target range
+            if not (min_delta <= delta <= max_delta):
+                continue
+            
+            # Skip if strike is too far from current price
+            strike_pct = (strike / current_price - 1) * 100
+            if is_put and strike_pct > (STRIKE_PRICE_RANGE * 100):
+                continue
+            elif not is_put and strike_pct < -(STRIKE_PRICE_RANGE * 100):
+                continue
+            
+            # Skip if open interest or volume is too low
+            if opt['open_interest'] < MIN_OPEN_INTEREST:
+                continue
+                
+            if opt['volume'] < MIN_VOLUME:
+                continue
+            
+            # Calculate bid-ask spread as % of mid price
+            spread = opt['ask'] - opt['bid']
+            spread_pct = (spread / opt['mid_price'] * 100) if opt['mid_price'] > 0 else 100
+            
+            # Skip if spread is too wide
+            if spread_pct > MAX_BID_ASK_SPREAD_PCT:
+                continue
+            
+            # Calculate days to expiration
+            dte = max(1, opt.get('days_to_expiration', 30))
+            
+            # Calculate premium per day
+            premium_per_day = opt['mid_price'] / dte if dte > 0 else 0
+            
+            # Calculate annualized yield
             if is_put:
-                moneyness = (option['strike_price'] - current_price) / current_price
-                itm = option['strike_price'] > current_price
+                annualized_yield = (opt['mid_price'] / strike) * (365 / dte) * 100
+                roc = (opt['mid_price'] / strike) * 100  # ROC for CSPs
+                monthly_roc = roc * (30 / dte)  # Monthly ROC
+                break_even = strike - opt['mid_price']
             else:
-                moneyness = (current_price - option['strike_price']) / current_price
-                itm = option['strike_price'] < current_price
+                annualized_yield = (opt['mid_price'] / current_price) * (365 / dte) * 100
+                roc = (opt['mid_price'] / current_price) * 100  # ROC for covered calls
+                monthly_roc = roc * (30 / dte)  # Monthly ROC
+                break_even = strike + opt['mid_price']
             
-            # Calculate metrics
-            premium = option.get('mid_price', 0)
-            annualized_yield = option.get('annualized_yield', 0)
-            delta = abs(option.get('delta', 0))
-            
-            # Check all filter conditions
-            if not all(k in option for k in ['strike_price', 'delta', 'premium_yield']):
-                skip_reason = "Missing required fields"
-            elif not (min_delta <= delta <= max_delta):
-                skip_reason = f"Delta {delta:.4f} outside range [{min_delta}, {max_delta}]"
-            elif premium < MIN_PREMIUM:
-                skip_reason = f"Premium ${premium:.2f} below minimum ${MIN_PREMIUM}"
-            elif option.get('open_interest', 0) < MIN_OPEN_INTEREST:
-                skip_reason = f"Open interest {option.get('open_interest', 0)} below minimum {MIN_OPEN_INTEREST}"
-            elif annualized_yield < MIN_ANNUALIZED_YIELD:
-                skip_reason = f"Annualized yield {annualized_yield:.1f}% below minimum {MIN_ANNUALIZED_YIELD}%"
-            
-            # Only show detailed logs for the first 20 options to reduce noise
-            if i < 20 or skip_reason is None:
-                print(f"\n--- Option {i+1} ---")
-                print(f"Contract: {option.get('contract_symbol', 'N/A')}")
-                print(f"Strike: ${option.get('strike_price', 'N/A'):.2f} (${current_price - option.get('strike_price', 0):.2f} {'ITM' if itm else 'OTM'})")
-                print(f"Exp: {option.get('expiration_date', 'N/A')} | DTE: {option.get('dte', 'N/A')}")
-                print(f"Δ: {delta:.4f} | Premium: ${premium:.2f} | Yield: {option.get('premium_yield', 0):.2f}%")
-                print(f"OI: {option.get('open_interest', 0):,} | Vol: {option.get('volume', 0):,} | IV: {option.get('implied_volatility', 0):.1f}%")
-                print(f"Bid: ${option.get('bid', 0):.2f} | Ask: ${option.get('ask', 0):.2f} | Last: ${option.get('last', 0):.2f}")
-                print(f"Annualized: {annualized_yield:.1f}% | ROC: {option.get('return_on_capital', 0):.1f}%")
+            # Skip if yield is too low
+            if annualized_yield < MIN_ANNUALIZED_YIELD:
+                continue
                 
-                if skip_reason:
-                    print(f"❌ Skipping - {skip_reason}")
+            # Skip if monthly ROC is too low
+            if monthly_roc < MIN_ROC:
+                continue
             
-            if not skip_reason:
-                # Add additional metrics to the option
-                option['moneyness'] = moneyness
-                option['itm'] = itm
-                option['days_to_exp'] = (datetime.strptime(option.get('expiration_date', ''), '%Y-%m-%d').date() - date.today()).days
-                filtered_options.append(option)
-                
+            # Calculate probability ITM (using delta as proxy)
+            probability_itm = delta * 100  # Convert to percentage
+            
+            # Skip if probability ITM is too low
+            if probability_itm < MIN_PROBABILITY_ITM:
+                continue
+            
+            # Calculate risk/reward ratio
+            if is_put:
+                max_risk = strike - opt['mid_price']
+                max_reward = opt['mid_price']
+            else:
+                max_risk = float('inf')  # Unlimited risk for naked calls
+                max_reward = opt['mid_price']
+            
+            risk_reward_ratio = (max_reward / max_risk) if max_risk > 0 else float('inf')
+            
+            # Add calculated metrics to option dict
+            opt.update({
+                'annualized_yield': annualized_yield,
+                'return_on_capital': roc,
+                'monthly_roc': monthly_roc,
+                'annualized_roc': monthly_roc * 12,  # Annualized ROC
+                'premium_per_day': premium_per_day,
+                'break_even': break_even,
+                'probability_itm': probability_itm,
+                'risk_reward_ratio': risk_reward_ratio,
+                'spread_pct': spread_pct,
+                'days_to_expiration': dte,
+                'strike_pct_otm': -strike_pct if is_put else strike_pct,
+                'type': 'Put' if is_put else 'Call'
+            })
+            
+            filtered.append(opt)
+            
         except Exception as e:
-            print(f"Error processing option {i+1}: {str(e)}")
+            print(f"⚠️ Error processing option: {e}")
+            import traceback
+            traceback.print_exc()
             continue
-            print(f"❌ Skipping - Open interest {option['open_interest']} below minimum {MIN_OPEN_INTEREST}")
-            continue
-            
-        if 'volume' in option and option['volume'] < MIN_VOLUME:
-            print(f"❌ Skipping - Volume {option['volume']} below minimum {MIN_VOLUME}")
-            continue
-            
-        # Check days to expiration
-        if 'days_to_exp' in option and option['days_to_exp'] < 7:
-            print(f"⚠️  Warning - Only {option['days_to_exp']} days to expiration")
-            
-        # Calculate and display key metrics
-        premium_yield = (option['mid'] / current_price) * 100
-        annualized = option.get('annualized_return', 0)
-        roc = option.get('return_on_capital', 0)
-        print(f"✅ Passing all filters - Yield: {premium_yield:.2f}%, Annualized: {annualized:.2f}%, ROC: {roc:.2f}%")
+    
+    # Sort by the selected ranking metric
+    if filtered:
+        print(f"✅ Found {len(filtered)} viable {option_type} trades")
         
-        filtered_options.append(option)
+        # Define ranking metrics (higher is better)
+        rank_metrics = {
+            'annualized_yield': lambda x: x.get('annualized_yield', 0),
+            'annualized_roc': lambda x: x.get('annualized_roc', 0),
+            'premium_per_day': lambda x: x.get('premium_per_day', 0),
+            'risk_reward': lambda x: x.get('risk_reward_ratio', 0),
+            'probability_itm': lambda x: x.get('probability_itm', 0)
+        }
+        
+        # Sort by the selected metric (descending)
+        if TRADE_RANK_METRIC in rank_metrics:
+            filtered.sort(key=rank_metrics[TRADE_RANK_METRIC], reverse=True)
+        else:
+            # Default sort by annualized ROC
+            filtered.sort(key=rank_metrics['annualized_roc'], reverse=True)
+        
+        # Limit to top N trades
+        filtered = filtered[:MAX_TRADES_PER_TYPE]
+    else:
+        print(f"⚠️ No {option_type} options passed all filters")
     
-    # Sort by annualized return (descending)
-    filtered_options.sort(key=lambda x: x.get('annualized_return', 0), reverse=True)
+    return filtered
+
+def generate_trade_idea_sheet(puts: List[Dict], calls: List[Dict], output_dir: str = 'output', simulate_forward: bool = True) -> str:
+    """
+    Generate a markdown report with the best trading opportunities.
     
-    print(f"\nFound {len(filtered_options)} options that passed all filters")
-    return filtered_options
+    Args:
+        puts: List of filtered put options
+        calls: List of filtered call options
+        output_dir: Directory to save the report
+        simulate_forward: Whether to simulate forward or backtest
+        
+    Returns:
+        Path to the generated report
+    """
+    os.makedirs(output_dir, exist_ok=True)
+    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+    filename = os.path.join(output_dir, f'trade_ideas_{timestamp}.md')
+    
+    # Prepare markdown content
+    md_content = [
+        "# 📊 Daily Options Trade Ideas",
+        f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n",
+        "## 📈 Market Overview",
+        "*Market data as of latest close*\n"
+    ]
+    
+    # Get current prices for all tickers
+    underlying_prices = {}
+    for option in puts + calls:
+        ticker = option.get('ticker')
+        price = option.get('underlying_price')
+        if ticker and price:
+            underlying_prices[ticker] = price
+    
+    # Simulate top trades
+    top_puts = puts[:5]  # Top 5 puts for simulation
+    top_calls = calls[:5]  # Top 5 calls for simulation
+    
+    # Add simulation data to top trades
+    simulated_puts = simulate_recommended_trades(top_puts, underlying_prices, simulate_forward)
+    simulated_calls = simulate_recommended_trades(top_calls, underlying_prices, simulate_forward)
+    
+    # Update the original lists with simulation results
+    for i, put in enumerate(simulated_puts):
+        if i < len(puts):
+            puts[i].update(put)
+    
+    for i, call in enumerate(simulated_calls):
+        if i < len(calls):
+            calls[i].update(call)
+    
+    # Add best puts section
+    md_content.extend([
+        "\n## 💰 Best Cash-Secured Puts",
+        "| Ticker | Price | Strike | Premium | Yield | Annualized | DTE | Prob ITM | Sim. Profit % | Sim. Max DD % |",
+        "|--------|-------|--------|---------|-------|------------|-----|----------|---------------|---------------|"
+    ])
+    
+    for put in puts[:10]:  # Top 10 puts
+        sim = put.get('simulation', {})
+        md_content.append(
+            f"| {put.get('ticker', 'N/A')} | "
+            f"${put.get('underlying_price', 0):.2f} | "
+            f"${put.get('strike_price', 0):.2f} | "
+            f"${put.get('mid_price', 0):.2f} | "
+            f"{put.get('premium_yield', 0):.1f}% | "
+            f"{put.get('annualized_yield', 0):.1f}% | "
+            f"{put.get('days_to_expiration', 0)} | "
+            f"{put.get('probability_itm', 0):.1f}% | "
+            f"{sim.get('realized_yield', 'N/A'):.1f}% | "
+            f"{abs(sim.get('max_drawdown', 0)):.1f}% |"
+        )
+    
+    # Add best calls section
+    md_content.extend([
+        "\n## 📈 Best Covered Calls",
+        "| Ticker | Price | Strike | Premium | Yield | Annualized | DTE | Prob ITM | Sim. Profit % | Sim. Max DD % |",
+        "|--------|-------|--------|---------|-------|------------|-----|----------|---------------|---------------|"
+    ])
+    
+    for call in calls[:10]:  # Top 10 calls
+        sim = call.get('simulation', {})
+        md_content.append(
+            f"| {call.get('ticker', 'N/A')} | "
+            f"${call.get('underlying_price', 0):.2f} | "
+            f"${call.get('strike_price', 0):.2f} | "
+            f"${call.get('mid_price', 0):.2f} | "
+            f"{call.get('premium_yield', 0):.1f}% | "
+            f"{call.get('annualized_yield', 0):.1f}% | "
+            f"{call.get('days_to_expiration', 0)} | "
+            f"{call.get('probability_itm', 0):.1f}% | "
+            f"{sim.get('realized_yield', 'N/A'):.1f}% | "
+            f"{abs(sim.get('max_drawdown', 0)):.1f}% |"
+        )
+    
+    # Add trade recommendations with simulation results
+    md_content.extend([
+        "\n## 🎯 Top Trade Recommendations with Simulation"
+    ])
+    
+    # Best Put recommendation with simulation
+    if puts and 'simulation' in puts[0]:
+        put = puts[0]
+        sim = put['simulation']
+        md_content.extend([
+            "### 1. Best Overall Put",
+            f"- **{put['ticker']}** ${put['strike_price']:.2f} Put @ ${put['mid_price']:.2f}",
+            f"- **Entry Price:** ${put.get('underlying_price', 0):.2f}",
+            f"- **Expiration:** {put.get('expiration', 'N/A')} (in {put.get('days_to_expiration', 0)} days)",
+            f"- **Premium Yield:** {put.get('premium_yield', 0):.1f}% ({put.get('annualized_yield', 0):.1f}% annualized)",
+            f"- **Simulated Profit:** {sim.get('realized_yield', 'N/A'):.1f}% (Max DD: {abs(sim.get('max_drawdown', 0)):.1f}%)",
+            f"- **Prob. Profit:** {sim.get('probability_of_profit', 'N/A')}% | **Breakeven:** ${sim.get('breakeven', 'N/A'):.2f}",
+            f"- **Simulated Exit:** ${sim.get('exit_price', 'N/A'):.2f} after {sim.get('held_days', 'N/A')} days"
+        ])
+    
+    # Best Call recommendation with simulation
+    if calls and 'simulation' in calls[0]:
+        call = calls[0]
+        sim = call['simulation']
+        md_content.extend([
+            "\n### 2. Best Overall Call",
+            f"- **{call['ticker']}** ${call['strike_price']:.2f} Call @ ${call['mid_price']:.2f}",
+            f"- **Entry Price:** ${call.get('underlying_price', 0):.2f}",
+            f"- **Expiration:** {call.get('expiration', 'N/A')} (in {call.get('days_to_expiration', 0)} days)",
+            f"- **Premium Yield:** {call.get('premium_yield', 0):.1f}% ({call.get('annualized_yield', 0):.1f}% annualized)",
+            f"- **Simulated Profit:** {sim.get('realized_yield', 'N/A'):.1f}% (Max DD: {abs(sim.get('max_drawdown', 0)):.1f}%)",
+            f"- **Prob. Profit:** {sim.get('probability_of_profit', 'N/A')}% | **Breakeven:** ${sim.get('breakeven', 'N/A'):.2f}",
+            f"- **Simulated Exit:** ${sim.get('exit_price', 'N/A'):.2f} after {sim.get('held_days', 'N/A')} days"
+        ])
+    
+    # Add notes and disclaimers
+    md_content.extend([
+        "\n## 📝 Notes & Disclaimers",
+        "- **All metrics** are calculated based on mid-price between bid and ask.",
+        "- **Prob ITM** is estimated using delta as a proxy.",
+        "- **Simulation results** are based on historical data and mathematical models, not guarantees of future performance.",
+        "- **Max Drawdown (DD)** shows the maximum observed decline from peak value during the simulation period.",
+        "- **Always** consider your risk tolerance and do your own research before trading.",
+        "- **Past performance** is not indicative of future results.",
+        f"- **Simulation mode:** {'Forward' if simulate_forward else 'Backtest'} simulation"
+    ])
+    
+    # Write to file
+    with open(filename, 'w', encoding='utf-8') as f:
+        f.write('\n'.join(line for line in md_content if line is not None))
+    
+    return filename
 
 def format_option_display(options, is_put=True):
     """Format options for display"""
@@ -745,74 +1001,99 @@ def format_option_display(options, is_put=True):
     
     return '\n'.join(lines)
 
-def save_to_markdown(ticker, price, puts=None, calls=None, filename=None):
+def save_to_markdown(ticker: str, price: float, puts: List[Dict] = None, calls: List[Dict] = None, filename: str = None) -> str:
     """
-    Save options analysis to a markdown file.
+    Save options analysis to a markdown file with enhanced metrics.
     
     Args:
-        ticker (str): Stock ticker symbol
-        price (float): Current stock price
-        puts (list, optional): List of put option dictionaries
-        calls (list, optional): List of call option dictionaries
-        filename (str, optional): Output filename. If None, uses a default name.
+        ticker: Stock ticker symbol
+        price: Current stock price
+        puts: List of put option dictionaries
+        calls: List of call option dictionaries
+        filename: Output filename (default: 'output/{ticker}_analysis_YYYYMMDD_HHMMSS.md')
+        
+    Returns:
+        Path to the saved file
     """
+    # Handle default arguments
     if puts is None:
         puts = []
     if calls is None:
         calls = []
         
     # Create output directory if it doesn't exist
-    output_dir = 'output'
-    os.makedirs(output_dir, exist_ok=True)
+    os.makedirs('output', exist_ok=True)
     
-    # If no filename provided, use a default one with timestamp
-    if not filename:
+    # Generate filename if not provided
+    if filename is None:
         timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-        filename = f"{output_dir}/options_analysis_{ticker}_{timestamp}.md"
+        filename = f'output/{ticker}_analysis_{timestamp}.md'
     
     # Prepare markdown content
     md_content = [
-        f"# 📊 Options Analysis - {ticker}",
-        f"**Date/Time:** {datetime.now().strftime('%Y-%m-%d %H:%M')}",
-        f"**Current Price:** ${price:.2f}",
-        ""
+        f"# 📊 Options Analysis: {ticker}",
+        f"**Current Price:** ${price:.2f}  ",
+        f"**Last Updated:** {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
     ]
     
     # Add puts section if available
     if puts:
         md_content.extend([
-            "## 📉 Cash-Secured Puts",
-            "| Contract | Strike | Premium | Δ | Yield | Annualized | ROC | DTE | OI | Vol |",
-            "|----------|--------|---------|--|-------|------------|-----|-----|----|-----|"
+            "## 💰 Put Options",
+            "| Strike | Premium | Δ | Yield | Annualized | ROC | DTE | Prob ITM | R/R | OI | Volume |",
+            "|--------|---------|--|-------|------------|-----|-----|----------|-----|----|--------|"
         ])
-        for put in sorted(puts, key=lambda x: x['strike'], reverse=True):
+        
+        # Sort puts by annualized yield and take top 20
+        for put in sorted(puts, key=lambda x: x.get('annualized_yield', 0), reverse=True)[:20]:
             md_content.append(
-                f"| {put.get('symbol', 'N/A')} | ${put['strike']:.2f} | ${put['mid']:.2f} | "
-                f"{put.get('delta', 0):+.2f} | {put['premium_yield']:.2f}% | {put['annualized_return']:.2f}% | "
-                f"{put['roc']:.2f}% | {put.get('dte', 0)}d | {put.get('open_interest', 0)} | {put.get('volume', 0)} |"
+                f"| ${put.get('strike_price', 0):.2f} | "
+                f"${put.get('mid_price', 0):.2f} | "
+                f"{put.get('delta', 0):.2f} | "
+                f"{put.get('premium_yield', 0):.1f}% | "
+                f"{put.get('annualized_yield', 0):.1f}% | "
+                f"{put.get('monthly_roc', 0):.1f}% | "
+                f"{put.get('days_to_expiration', 0)} | "
+                f"{put.get('probability_itm', 0):.1f}% | "
+                f"1:{put.get('risk_reward_ratio', 0):.1f} | "
+                f"{put.get('open_interest', 0):,} | "
+                f"{put.get('volume', 0):,} |"
             )
     else:
-        md_content.append("No put options available.")
+        md_content.append("\nNo qualifying put options found.\n")
     
     # Add calls section if available
     if calls:
         md_content.extend([
-            "\n## 📈 Covered Calls",
-            "| Contract | Strike | Premium | Δ | Yield | Annualized | ROC | DTE | OI | Vol |",
-            "|----------|--------|---------|--|-------|------------|-----|-----|----|-----|"
+            "\n## 📈 Call Options",
+            "| Strike | Premium | Δ | Yield | Annualized | ROC | DTE | Prob ITM | R/R | OI | Volume |",
+            "|--------|---------|--|-------|------------|-----|-----|----------|-----|----|--------|"
         ])
-        for call in sorted(calls, key=lambda x: x['strike']):
+        
+        # Sort calls by annualized yield and take top 20
+        for call in sorted(calls, key=lambda x: x.get('annualized_yield', 0), reverse=True)[:20]:
             md_content.append(
-                f"| {call.get('symbol', 'N/A')} | ${call['strike']:.2f} | ${call['mid']:.2f} | "
-                f"{call.get('delta', 0):+.2f} | {call['premium_yield']:.2f}% | {call['annualized_return']:.2f}% | "
-                f"{call['roc']:.2f}% | {call.get('dte', 0)}d | {call.get('open_interest', 0)} | {call.get('volume', 0)} |"
+                f"| ${call.get('strike_price', 0):.2f} | "
+                f"${call.get('mid_price', 0):.2f} | "
+                f"{call.get('delta', 0):.2f} | "
+                f"{call.get('premium_yield', 0):.1f}% | "
+                f"{call.get('annualized_yield', 0):.1f}% | "
+                f"{call.get('monthly_roc', 0):.1f}% | "
+                f"{call.get('days_to_expiration', 0)} | "
+                f"{call.get('probability_itm', 0):.1f}% | "
+                f"1:{call.get('risk_reward_ratio', 0):.1f} | "
+                f"{call.get('open_interest', 0):,} | "
+                f"{call.get('volume', 0):,} |"
             )
     else:
-        md_content.append("\nNo call options available.")
+        md_content.append("\nNo qualifying call options found.\n")
+    
+    # Add footer with timestamp
+    md_content.append(f"\n*Generated on {datetime.now().strftime('%Y-%m-%d at %H:%M:%S')}*")
     
     # Write to file
-    with open(filename, 'a', encoding='utf-8') as f:
-        f.write('\n'.join(md_content) + '\n\n')
+    with open(filename, 'w', encoding='utf-8') as f:
+        f.write('\n'.join(md_content))
     
     return filename
 
@@ -822,19 +1103,9 @@ def print_header():
     print(f"📊 OPTIONS SCREENER - {datetime.now().strftime('%Y-%m-%d %H:%M')}")
     print("="*80)
     
-    # Check market status
     market_status = get_market_status()
-    if market_status == 'open':
-        status_msg = "✅ Market is currently OPEN"
-    elif market_status == 'closed':
-        status_msg = "❌ Market is currently CLOSED (data may be stale)"
-    else:
-        status_msg = "ℹ️ Market status unknown"
+    status_msg = f"✅ Market is currently {'open' if market_status == 'open' else 'closed'}" if market_status else "❓ Market status unknown"
     
-    print(f"\n{status_msg}")
-    print("-"*80)
-    
-    # Prepare markdown content
     md_content = [
         f"# 📊 Options Screener - {datetime.now().strftime('%Y-%m-%d %H:%M')}",
         "",
@@ -856,6 +1127,16 @@ def print_header():
     return md_content
 
 def run():
+    """
+    Main function to run the options analysis.
+    
+    This function:
+    1. Sets up the output directory and initializes tracking variables
+    2. Processes each ticker in TICKERS list
+    3. Fetches and analyzes options data for each ticker
+    4. Generates and saves markdown reports
+    5. Handles errors and provides summary statistics
+    """
     # Create output directory if it doesn't exist
     os.makedirs('output', exist_ok=True)
     
@@ -863,186 +1144,317 @@ def run():
     timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
     output_file = f'output/options_analysis_{timestamp}.md'
     
-    # Print header and get initial markdown content
-    md_content = print_header()
-    
-    # Initialize results storage
-    all_puts = []
-    all_calls = []
+    # Initialize stats
     stats = {
         'tickers_processed': 0,
         'tickers_with_puts': 0,
         'tickers_with_calls': 0,
+        'tickers_with_errors': 0,
         'total_puts_found': 0,
         'total_calls_found': 0,
         'start_time': datetime.now(),
         'errors': []
     }
     
+    all_puts = []
+    all_calls = []
+    
+    # Print header and get initial markdown content
+    md_content = print_header()
+    
+    print("="*80)
+    print(f"🚀 Starting options analysis for {len(TICKERS)} tickers")
+    print(f"⏰ {stats['start_time'].strftime('%Y-%m-%d %H:%M:%S')}")
+    print("="*80)
+    
+    # Add ticker list to markdown
+    md_content.extend([
+        "## 📋 Tickers Analyzed",
+        "",
+        "| Ticker | Status | Puts Found | Calls Found | Error |",
+        "|--------|--------|------------|-------------|-------|"
+    ])
+    
     # Process each ticker
     for ticker in TICKERS:
+        ticker_start = datetime.now()
+        stats['tickers_processed'] += 1
+        ticker_status = ""
+        ticker_error = ""
+        puts_found = 0
+        calls_found = 0
+        price = None
+        options_chain = None
+        
         try:
-            stats['tickers_processed'] += 1
             print(f"\n{'='*80}\n📊 [{stats['tickers_processed']}/{len(TICKERS)}] Analyzing {ticker}")
             print("-"*80)
             
             # Get stock price
+            print(f"🔍 Fetching current price for {ticker}...")
             price = get_stock_price(ticker)
-            if not price:
-                error_msg = f"❌ Failed to fetch price for {ticker}"
+            if not price or price <= 0:
+                raise ValueError(f"Invalid price ${price:.2f} for {ticker}")
+            
+            print(f"✅ Current price: ${price:.2f}")
+            
+            # Get options chain with progress indication
+            print(f"🔍 Fetching options chain for {ticker}...")
+            # First get puts
+            puts_chain = get_options_chain(ticker, 'put', price)
+            # Then get calls
+            calls_chain = get_options_chain(ticker, 'call', price)
+            
+            # Combine the results
+            options_chain = {'results': []}
+            if puts_chain and 'results' in puts_chain:
+                options_chain['results'].extend(puts_chain['results'])
+            if calls_chain and 'results' in calls_chain:
+                options_chain['results'].extend(calls_chain['results'])
+                
+            if not options_chain['results']:
+                raise ValueError("No valid options found for either puts or calls")
+                
+            print(f"✅ Found {len(options_chain.get('results', []))} options contracts")
+            
+            # Process puts and calls
+            print(f"📊 Processing options data for {ticker}...")
+            
+            try:
+                # Process and filter options
+                puts, calls = process_options_chain(options_chain, price)
+                
+                # Update stats and collections
+                if puts:
+                    all_puts.extend(puts)
+                    puts_found = len(puts)
+                    stats['tickers_with_puts'] += 1
+                    stats['total_puts_found'] += puts_found
+                    print(f"✅ Found {puts_found} qualifying put options")
+                    
+                if calls:
+                    all_calls.extend(calls)
+                    calls_found = len(calls)
+                    stats['tickers_with_calls'] += 1
+                    stats['total_calls_found'] += calls_found
+                    print(f"✅ Found {calls_found} qualifying call options")
+                
+                if not puts and not calls:
+                    ticker_status = "⚠️ No qualifying options"
+                    print(ticker_status)
+                else:
+                    ticker_status = "✅ Success"
+                
+                # Add ticker results to markdown
+                md_content.append(f"| {ticker} | {ticker_status} | {puts_found} | {calls_found} | {ticker_error[:50] + '...' if ticker_error else ''} |")
+                
+                # Add PUT results
+                if puts:
+                    md_content.extend([
+                        f"\n### 📉 PUT Options",
+                        "| Strike | Premium | Δ | Yield | Annualized | ROC | DTE | Prob ITM | R/R | OI | Volume |",
+                        "|--------|---------|--|-------|------------|-----|-----|----------|-----|----|--------|"
+                    ])
+                    for put in sorted(puts, key=lambda x: x.get('strike_price', 0)):
+                        md_content.append(
+                            f"| ${put.get('strike_price', 0):.2f} | "
+                            f"${put.get('mid_price', 0):.2f} | "
+                            f"{put.get('delta', 0):.2f} | "
+                            f"{put.get('premium_yield', 0):.1f}% | "
+                            f"{put.get('annualized_yield', 0):.1f}% | "
+                            f"{put.get('monthly_roc', 0):.1f}% | "
+                            f"{put.get('days_to_expiration', 0)} | "
+                            f"{put.get('probability_itm', 0):.1f}% | "
+                            f"1:{put.get('risk_reward_ratio', 0):.1f} | "
+                            f"{put.get('open_interest', 0):,} | "
+                            f"{put.get('volume', 0):,} |"
+                        )
+                
+                # Add CALL results
+                if calls:
+                    md_content.extend([
+                        f"\n### 📈 CALL Options",
+                        "| Strike | Premium | Δ | Yield | Annualized | ROC | DTE | Prob ITM | R/R | OI | Volume |",
+                        "|--------|---------|--|-------|------------|-----|-----|----------|-----|----|--------|"
+                    ])
+                    for call in sorted(calls, key=lambda x: x.get('strike_price', 0)):
+                        md_content.append(
+                            f"| ${call.get('strike_price', 0):.2f} | "
+                            f"${call.get('mid_price', 0):.2f} | "
+                            f"{call.get('delta', 0):.2f} | "
+                            f"{call.get('premium_yield', 0):.1f}% | "
+                            f"{call.get('annualized_yield', 0):.1f}% | "
+                            f"{call.get('monthly_roc', 0):.1f}% | "
+                            f"{call.get('days_to_expiration', 0)} | "
+                            f"{call.get('probability_itm', 0):.1f}% | "
+                            f"1:{call.get('risk_reward_ratio', 0):.1f} | "
+                            f"{call.get('open_interest', 0):,} | "
+                            f"{call.get('volume', 0):,} |"
+                        )
+                
+                # Add separator between tickers
+                md_content.append("\n---\n")
+                
+            except Exception as e:
+                error_msg = f"❌ Error processing {ticker}: {str(e)}"
                 print(error_msg)
                 stats['errors'].append(error_msg)
+                md_content.append(f"| {ticker} | ❌ Error | 0 | 0 | {str(e)[:50]}... |")
+                stats['tickers_with_errors'] += 1
                 continue
-                
-            print(f"💵 Current Price: ${price:.2f}")
             
-            # Get options chains
-            print("\n🔍 Fetching options data...")
-            puts = get_options_chain(ticker, 'put', price)
-            calls = get_options_chain(ticker, 'call', price)
-            
-            # Summarize options
-            print("\n📊 Analyzing PUT options...")
-            put_results = summarize_options(puts, price, is_put=True)
-            print("\n📊 Analyzing CALL options...")
-            call_results = summarize_options(calls, price, is_put=False)
-            
-            # Store results for summary
-            if put_results:
-                stats['tickers_with_puts'] += 1
-                stats['total_puts_found'] += len(put_results)
-                for put in put_results:
-                    all_puts.append({
-                        'ticker': ticker,
-                        'price': price,
-                        **put
-                    })
-                
-            if call_results:
-                stats['tickers_with_calls'] += 1
-                stats['total_calls_found'] += len(call_results)
-                for call in call_results:
-                    all_calls.append({
-                        'ticker': ticker,
-                        'price': price,
-                        **call
-                    })
-            
-            # Add ticker results to markdown
-            md_content.append(f"## {ticker} - ${price:.2f}")
-            
-            # Add PUT results
-            if put_results:
-                md_content.extend([
-                    "### 📉 Cash-Secured Puts (Best Yields)",
-                    "| Contract | Strike | Premium | Δ | Yield | Annualized | ROC | DTE | OI | Vol |",
-                    "|----------|--------|---------|--|-------|------------|-----|-----|----|-----|"
-                ])
-                
-                for put in put_results[:5]:  # Top 5 puts
-                    md_content.append(
-                        f"| {put['symbol']} | ${put['strike']:.2f} | ${put['mid']:.2f} | "
-                        f"{put['delta']:+.2f} | {put['premium_yield']:.2f}% | {put['annualized_return']:.2f}% | "
-                        f"{put['roc']:.2f}% | {put['dte']}d | {put['open_interest']} | {put['volume']} |"
-                    )
-                
-                # Save puts to markdown
-                save_to_markdown(ticker, price, put_results, [], filename=output_file)
-            else:
-                md_content.append("No suitable put options found matching criteria.")
-            
-            # Add CALL results
-            if call_results:
-                md_content.extend([
-                    "\n### 📈 Covered Calls (Best Yields)",
-                    "| Contract | Strike | Premium | Δ | Yield | Annualized | ROC | DTE | OI | Vol |",
-                    "|----------|--------|---------|--|-------|------------|-----|-----|----|-----|"
-                ])
-                
-                for call in call_results[:5]:  # Top 5 calls
-                    md_content.append(
-                        f"| {call['symbol']} | ${call['strike']:.2f} | ${call['mid']:.2f} | "
-                        f"{call['delta']:+.2f} | {call['premium_yield']:.2f}% | {call['annualized_return']:.2f}% | "
-                        f"{call['roc']:.2f}% | {call['dte']}d | {call['open_interest']} | {call['volume']} |"
-                    )
-                
-                # Save calls to markdown
-                save_to_markdown(ticker, price, [], call_results, filename=output_file)
-            else:
-                md_content.append("\nNo suitable call options found matching criteria.")
-            
-            md_content.append("\n---\n")
+            # Add a small delay to avoid rate limiting
+            time.sleep(0.5)
             
         except Exception as e:
-            error_msg = f"❌ Error processing {ticker}: {str(e)}"
+            error_msg = f"❌ Error fetching data for {ticker}: {str(e)}"
             print(error_msg)
             stats['errors'].append(error_msg)
-            import traceback
-            traceback.print_exc()
+            md_content.append(f"| {ticker} | ❌ Error | 0 | 0 | {str(e)[:50]}... |")
+            stats['tickers_with_errors'] += 1
+            continue
     
-    # Add summary section
+    # After processing all tickers, add summary section
+    md_content.extend([
+        "\n## 📊 Analysis Summary",
+        f"- **Total tickers processed:** {stats['tickers_processed']}",
+        f"- **Tickers with qualifying puts:** {stats['tickers_with_puts']}",
+        f"- **Tickers with qualifying calls:** {stats['tickers_with_calls']}",
+        f"- **Total puts found:** {stats['total_puts_found']}",
+        f"- **Total calls found:** {stats['total_calls_found']}",
+        f"- **Tickers with errors:** {stats['tickers_with_errors']}",
+        f"- **Total runtime:** {datetime.now() - stats['start_time']}",
+        "",
+        "## 🔍 Top Trades by Annualized Yield"
+    ])
+    
+    # Add top puts
+    if all_puts:
+        md_content.extend([
+            "\n### 🏆 Top 5 Cash-Secured Puts",
+            "| Ticker | Strike | Premium | Δ | Yield | Annualized | ROC | DTE | Prob ITM | R/R |",
+            "|--------|--------|---------|--|-------|------------|-----|-----|----------|-----|"
+        ])
+        for put in sorted(all_puts, key=lambda x: x.get('annualized_yield', 0), reverse=True)[:5]:
+            md_content.append(
+                f"| {put.get('ticker', 'N/A')} | "
+                f"${put.get('strike_price', 0):.2f} | "
+                f"${put.get('mid_price', 0):.2f} | "
+                f"{put.get('delta', 0):.2f} | "
+                f"{put.get('premium_yield', 0):.1f}% | "
+                f"{put.get('annualized_yield', 0):.1f}% | "
+                f"{put.get('monthly_roc', 0):.1f}% | "
+                f"{put.get('days_to_expiration', 0)} | "
+                f"{put.get('probability_itm', 0):.1f}% | "
+                f"1:{put.get('risk_reward_ratio', 0):.1f} |"
+            )
+    
+    # Add top calls
+    if all_calls:
+        md_content.extend([
+            "\n### 🏆 Top 5 Covered Calls",
+            "| Ticker | Strike | Premium | Δ | Yield | Annualized | ROC | DTE | Prob ITM | R/R |",
+            "|--------|--------|---------|--|-------|------------|-----|-----|----------|-----|"
+        ])
+        for call in sorted(all_calls, key=lambda x: x.get('annualized_yield', 0), reverse=True)[:5]:
+            md_content.append(
+                f"| {call.get('ticker', 'N/A')} | "
+                f"${call.get('strike_price', 0):.2f} | "
+                f"${call.get('mid_price', 0):.2f} | "
+                f"{call.get('delta', 0):.2f} | "
+                f"{call.get('premium_yield', 0):.1f}% | "
+                f"{call.get('annualized_yield', 0):.1f}% | "
+                f"{call.get('monthly_roc', 0):.1f}% | "
+                f"{call.get('days_to_expiration', 0)} | "
+                f"{call.get('probability_itm', 0):.1f}% | "
+                f"1:{call.get('risk_reward_ratio', 0):.1f} |"
+            )
+    
+    # Add errors if any
+    if stats['errors']:
+        md_content.extend([
+            "\n## ❌ Errors Encountered",
+            "The following errors were encountered during processing:"
+        ])
+        for error in stats['errors']:
+            md_content.append(f"- {error}")
+    
+    # Add footer
+    md_content.extend([
+        "",
+        "---",
+        f"Generated on {datetime.now().strftime('%Y-%m-%d at %H:%M:%S %Z')}",
+        ""
+    ])
+    
+    # Save to file
+    try:
+        with open(output_file, 'w', encoding='utf-8') as f:
+            f.write('\n'.join(md_content))
+        print(f"\n✅ Analysis complete! Results saved to {output_file}")
+        
+        # Generate trade idea sheet
+        trade_idea_file = generate_trade_idea_sheet(all_puts, all_calls)
+        if trade_idea_file:
+            print(f"📋 Trade idea sheet saved to {trade_idea_file}")
+            
+    except Exception as e:
+        print(f"❌ Error saving results: {str(e)}")
+    
+    # Add final summary statistics
     stats['end_time'] = datetime.now()
     stats['duration'] = (stats['end_time'] - stats['start_time']).total_seconds() / 60
     
     md_content.extend([
-        "## 📊 Summary",
-        "### Scan Statistics",
+        "\n## 📊 Final Summary",
         f"- **Tickers Processed:** {stats['tickers_processed']}",
         f"- **Tickers with Valid Puts:** {stats['tickers_with_puts']}",
         f"- **Tickers with Valid Calls:** {stats['tickers_with_calls']}",
         f"- **Total Puts Found:** {stats['total_puts_found']}",
         f"- **Total Calls Found:** {stats['total_calls_found']}",
-        f"- **Total Time:** {stats['duration']:.1f} minutes",
-        "",
-        "### 🏆 Top Opportunities"
+        f"- **Tickers with Errors:** {stats['tickers_with_errors']}",
+        f"- **Total Runtime:** {stats['duration']:.1f} minutes",
+        ""
     ])
     
-    # Add top puts and calls
-    if all_puts:
-        top_puts = sorted(all_puts, key=lambda x: x['annualized_return'], reverse=True)[:5]
-        md_content.extend([
-            "#### 💰 Top 5 Cash-Secured Puts",
-            "| Ticker | Price | Strike | Premium | Δ | Yield | Annualized | ROC | DTE |",
-            "|--------|-------|--------|---------|--|-------|------------|-----|-----|"
-        ])
-        for put in top_puts:
-            md_content.append(
-                f"| {put['ticker']} | ${put['price']:.2f} | ${put['strike']:.2f} | ${put['mid']:.2f} | "
-                f"{put['delta']:+.2f} | {put['premium_yield']:.2f}% | {put['annualized_return']:.2f}% | "
-                f"{put['roc']:.2f}% | {put['dte']}d |"
-            )
-    
-    if all_calls:
-        top_calls = sorted(all_calls, key=lambda x: x['annualized_return'], reverse=True)[:5]
-        md_content.extend([
-            "\n#### 💰 Top 5 Covered Calls",
-            "| Ticker | Price | Strike | Premium | Δ | Yield | Annualized | ROC | DTE |",
-            "|--------|-------|--------|---------|--|-------|------------|-----|-----|"
-        ])
-        for call in top_calls:
-            md_content.append(
-                f"| {call['ticker']} | ${call['price']:.2f} | ${call['strike']:.2f} | ${call['mid']:.2f} | "
-                f"{call['delta']:+.2f} | {call['premium_yield']:.2f}% | {call['annualized_return']:.2f}% | "
-                f"{call['roc']:.2f}% | {call['dte']}d |"
-            )
-    
-    # Add any errors to the end of the report
+    # Add any errors encountered
     if stats['errors']:
         md_content.extend([
-            "",
-            "## ⚠️ Errors Encountered",
-            "The following errors occurred during processing:"
+            "## ❌ Errors Encountered",
+            "The following errors were encountered during processing:"
         ])
         for error in stats['errors']:
             md_content.append(f"- {error}")
     
-    # Write the final markdown file
-    with open(output_file, 'w', encoding='utf-8') as f:
-        f.write('\n'.join(md_content))
+    # Add footer
+    md_content.extend([
+        "",
+        "---",
+        f"Generated on {datetime.now().strftime('%Y-%m-%d at %H:%M:%S %Z')}",
+        ""
+    ])
+    
+    # Save the final markdown file
+    try:
+        with open(output_file, 'w', encoding='utf-8') as f:
+            f.write('\n'.join(md_content))
+        print(f"\n✅ Final analysis saved to {output_file}")
+    except Exception as e:
+        print(f"❌ Error saving final results: {str(e)}")
+    
+    # Generate trade idea sheet if we have valid options
+    if all_puts or all_calls:
+        trade_sheet_path = generate_trade_idea_sheet(all_puts, all_calls)
+        if trade_sheet_path:
+            print(f"📊 Trade idea sheet generated: {os.path.abspath(trade_sheet_path)}")
     
     print(f"\n{'='*80}\n✅ Analysis complete!")
     print(f"📄 Report saved to: {os.path.abspath(output_file)}")
+    if 'trade_sheet_path' in locals() and trade_sheet_path:
+        print(f"📊 Trade ideas saved to: {os.path.abspath(trade_sheet_path)}")
     print("="*80)
+    
+    return output_file
 
 if __name__ == "__main__":
     try:

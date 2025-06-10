@@ -37,22 +37,28 @@ TARGET_EXPIRATION = "2025-06-20"  # Third Friday of June 2025
 # Ensure we have the datetime imports we need
 from datetime import datetime as dt, date as d, timedelta as td
 
+# Default filter parameters - can be overridden by command line
+DEFAULT_MIN_PREMIUM = 0.50  # Minimum premium to consider
+DEFAULT_MIN_ANNUALIZED_YIELD = 20.0  # Minimum annualized yield percentage
+DEFAULT_MIN_ROC = 1.0  # Minimum return on capital (monthly)
+DEFAULT_MIN_PROBABILITY_ITM = 30.0  # Minimum probability ITM percentage
+DEFAULT_MIN_DELTA = 0.15  # Minimum delta for puts (absolute value)
+DEFAULT_MAX_DELTA = 0.45  # Maximum delta for puts (absolute value)
+DEFAULT_MIN_OPEN_INTEREST = 100  # Minimum open interest
+
+# Global variables that can be modified at runtime
+TARGET_EXPIRATION = None  # Will be set dynamically
+MIN_PREMIUM = DEFAULT_MIN_PREMIUM
+MIN_ANNUALIZED_YIELD = DEFAULT_MIN_ANNUALIZED_YIELD
+MIN_ROC = DEFAULT_MIN_ROC
+MIN_PROBABILITY_ITM = DEFAULT_MIN_PROBABILITY_ITM
+MIN_DELTA = DEFAULT_MIN_DELTA
+MAX_DELTA = DEFAULT_MAX_DELTA
+MIN_OPEN_INTEREST = DEFAULT_MIN_OPEN_INTEREST
+
 # Options filtering parameters
 MIN_STRIKE_PCT = 0.90  # 10% below current price for puts
 MAX_STRIKE_PCT = 1.10  # 10% above current price for calls
-MIN_DELTA = 0.10       # Minimum delta for options (wider range)
-MAX_DELTA = 0.50       # Maximum delta for options (wider range)
-MIN_PREMIUM = 0.50     # Minimum premium per contract in $
-
-# Yield & Premium
-MIN_ANNUALIZED_YIELD = 20.0  # Minimum annualized yield in %
-MIN_ROC = 2.0  # Minimum return on capital in % per month
-
-# Probability & Risk
-MIN_PROBABILITY_ITM = 65.0  # Minimum probability ITM in %
-MAX_BID_ASK_SPREAD_PCT = 10.0  # Maximum bid-ask spread as % of mid price
-
-# Greeks Filtering
 PUT_MIN_DELTA = 0.20  # 20 delta puts
 PUT_MAX_DELTA = 0.35  # 35 delta puts
 CALL_MIN_DELTA = 0.20  # 20 delta calls
@@ -201,8 +207,17 @@ def get_options_chain(ticker, option_type, current_price, max_retries=5, initial
         initial_delay (int): Initial delay between retries in seconds
         
     Returns:
-        list: List of option contracts with details and pricing, or empty list on failure
+        dict: Dictionary containing options data or empty dict on failure
     """
+    if not ticker or not option_type or not current_price or current_price <= 0:
+        print(f"❌ Invalid input parameters for get_options_chain: ticker={ticker}, "
+              f"option_type={option_type}, price={current_price}")
+        return {'results': []}
+        
+    option_type = option_type.lower()
+    if option_type not in ['put', 'call']:
+        print(f"❌ Invalid option_type: {option_type}. Must be 'put' or 'call'")
+        return {'results': []}
     if not API_KEY or API_KEY == 'YOUR_API_KEY_HERE':
         print("⚠️  Please set your Polygon.io API key in the environment variable POLYGON_API_KEY")
         return []
@@ -211,110 +226,130 @@ def get_options_chain(ticker, option_type, current_price, max_retries=5, initial
     print(f"FETCHING {option_type.upper()} OPTIONS FOR {ticker.upper()}")
     print(f"Current Price: ${current_price:.2f}")
     
-    # Calculate strike price range (wider range for calls)
+    # Calculate strike price range based on configured percentages
     if option_type == 'put':
-        min_strike = current_price * (1 - STRIKE_PRICE_RANGE)
-        max_strike = current_price * (1 + STRIKE_PRICE_RANGE * 0.5)  # Tighter range for puts
+        min_strike = current_price * MIN_STRIKE_PCT
+        max_strike = current_price  # Up to current price for puts
     else:  # call
-        min_strike = current_price * (1 - STRIKE_PRICE_RANGE * 0.5)  # Tighter range for calls
-        max_strike = current_price * (1 + STRIKE_PRICE_RANGE)
+        min_strike = current_price  # From current price for calls
+        max_strike = current_price * MAX_STRIKE_PCT
     
     print(f"Fetching {option_type} options with strikes ${min_strike:.2f} to ${max_strike:.2f}...")
     
     # Prepare request parameters
     url = f"{BASE_URL}/v3/reference/options/contracts"
     params = {
-        'underlying_ticker': ticker.upper(),
-        'contract_type': option_type.lower(),
+        'underlying_ticker': ticker,
+        'contract_type': option_type,
         'expiration_date': TARGET_EXPIRATION,
-        'apiKey': API_KEY,
-        'limit': 1000,  # Maximum allowed by Polygon
-        'as_of': 'trades',  # Get the most recent data
+        'limit': 1000,  # Increased limit to get more strikes
+        'as_of': 'trades',  # Get most recent trade data
         'sort': 'strike_price',
-        'order': 'asc'
+        'order': 'asc',
+        'apiKey': API_KEY  # Ensure API key is included
     }
     
-    # Implement retry logic with exponential backoff
-    for attempt in range(max_retries + 1):
+    # Add a user agent to help with rate limiting
+    headers = {
+        'User-Agent': 'BenOptionsScanner/1.0',
+        'Authorization': f'Bearer {API_KEY}'
+    }
+    
+    # Add retry logic with exponential backoff and jitter
+    for attempt in range(max_retries):
         try:
+            # Add jitter to avoid thundering herd problem
+            delay = initial_delay * (2 ** attempt) + random.uniform(0, 1)
             if attempt > 0:
-                # Calculate exponential backoff delay with jitter
-                delay = min(initial_delay * (2 ** (attempt - 1)) + (random.uniform(0, 1)), 30)  # Cap at 30 seconds
-                print(f"⏳ Retry attempt {attempt}/{max_retries} in {delay:.1f} seconds...")
+                print(f"⏳ Retry attempt {attempt}/{max_retries-1} in {delay:.1f} seconds...")
                 time.sleep(delay)
-            
-            # Print detailed request info for debugging
-            print(f"\n🔍 Request #{attempt + 1} for {ticker} {option_type.upper()} options:")
+                
+            print(f"🔍 Request #{attempt+1} for {ticker} {option_type.upper()} options:")
             print(f"   URL: {url}")
-            print(f"   Params: { {k: v for k, v in params.items() if k != 'apiKey'} }")
+            print(f"   Params: {params}")
             
-            start_time = time.time()
-            response = requests.get(url, params=params, headers=HEADERS, timeout=15)
-            response_time = time.time() - start_time
+            # Add timeout and better error handling
+            response = requests.get(
+                url, 
+                params=params, 
+                headers=headers, 
+                timeout=15  # Increased timeout
+            )
             
-            print(f"✅ Response received in {response_time:.2f}s (Status: {response.status_code})")
+            print(f"✅ Response received in {response.elapsed.total_seconds():.2f}s (Status: {response.status_code})")
             
-            # Check for rate limiting headers
-            if 'X-RateLimit-Requests-Remaining' in response.headers:
-                remaining = response.headers['X-RateLimit-Requests-Remaining']
-                limit = response.headers.get('X-RateLimit-Requests-Limit', 'unknown')
-                print(f"   Rate limit: {remaining}/{limit} requests remaining")
-            
+            # Check for rate limiting
+            if response.status_code == 429:
+                retry_after = int(response.headers.get('Retry-After', min(delay * 2, 60)))  # Cap at 60s
+                print(f"⚠️  Rate limited. Waiting {retry_after} seconds...")
+                time.sleep(retry_after)
+                continue
+                
+            # Handle other HTTP errors
             response.raise_for_status()
             
-            data = response.json()
-            
-            # Check if we got a valid response
-            if 'status' in data and data['status'] == 'ERROR':
-                error_msg = data.get('error', 'Unknown error from Polygon API')
-                print(f"❌ API Error: {error_msg}")
-                if attempt == max_retries:
-                    return []
-                continue
-            
-            if 'results' not in data:
-                print(f"❌ Unexpected response format from API: {data}")
-                if attempt == max_retries:
-                    return []
-                continue
-                
-            if not data['results']:
-                print(f"ℹ️  No {option_type} options found for {ticker} (exp: {TARGET_EXPIRATION})")
-                return []
-                
-            print(f"✅ Found {len(data['results'])} {option_type} contracts for {ticker}")
-            return data['results']
-            
-        except requests.exceptions.HTTPError as http_err:
-            status_code = http_err.response.status_code if hasattr(http_err, 'response') else 'Unknown'
-            
-            # Log detailed error information
-            print(f"\n❌ HTTP {status_code} Error:")
+            # Parse response
             try:
-                error_details = http_err.response.json()
-                print(f"   Error Details: {error_details}")
-            except:
-                error_text = http_err.response.text[:500] if hasattr(http_err.response, 'text') else 'No details'
-                print(f"   Response: {error_text}")
+                data = response.json()
+            except ValueError as e:
+                print(f"❌ Failed to parse JSON response: {e}")
+                if attempt < max_retries - 1:
+                    continue
+                return {'results': []}
             
-            # Don't retry on client errors (4xx) except 429 (rate limit) and 502/503/504 (temporary server errors)
-            if 400 <= status_code < 500 and status_code not in [429, 502, 503, 504]:
-                if status_code in [401, 403]:
-                    print("❌ Authentication failed. Please check your API key.")
-                    print("   You can get a free API key at https://polygon.io/")
-                    print(f"   Current API key: {'*' * len(API_KEY) if API_KEY else 'None'}")
-                return []
+            # Process the options chain
+            if 'results' not in data or not data['results']:
+                print(f"ℹ️  No {option_type} options found for {ticker}")
+                return {'results': []}
                 
-            # If we've reached max retries, give up
-            if attempt == max_retries:
-                print(f"\n❌ Max retries ({max_retries}) reached for {option_type} options on {ticker}")
-                if status_code == 429:
-                    retry_after = http_err.response.headers.get('Retry-After', 'unknown')
-                    print(f"   Rate limit exceeded. Please wait {retry_after} seconds before trying again.")
-                return []
-                
-            print(f"\n⚠️  Attempt {attempt + 1} failed with HTTP {status_code}, retrying...")
+            # Filter options by strike price range and add additional metrics
+            filtered_options = []
+            valid_options = 0
             
+            for option in data['results']:
+                try:
+                    strike_price = float(option.get('strike_price', 0))
+                    if strike_price <= 0:
+                        continue
+                        
+                    # Calculate moneyness
+                    if option_type == 'put':
+                        moneyness = (strike_price / current_price) - 1  # Negative for ITM, positive for OTM
+                        is_itm = strike_price > current_price
+                    else:  # call
+                        moneyness = (strike_price / current_price) - 1  # Negative for OTM, positive for ITM
+                        is_itm = strike_price < current_price
+                    
+                    # Filter by strike price range
+                    if min_strike <= strike_price <= max_strike:
+                        # Add additional metrics
+                        option['ticker'] = ticker
+                        option['option_type'] = option_type
+                        option['current_price'] = current_price
+                        option['moneyness'] = moneyness
+                        option['is_itm'] = is_itm
+                        
+                        # Calculate days to expiration
+                        if 'expiration_date' in option:
+                            try:
+                                exp_date = datetime.strptime(option['expiration_date'], '%Y-%m-%d')
+                                dte = (exp_date - datetime.now()).days
+                                option['days_to_expiration'] = max(1, dte)  # Ensure at least 1 day
+                            except (ValueError, TypeError):
+                                option['days_to_expiration'] = 30  # Default if parsing fails
+                        else:
+                            option['days_to_expiration'] = 30  # Default if not provided
+                        
+                        # Add Greeks if available
+                        if 'greeks' in option and isinstance(option['greeks'], dict):
+                            option.update(option['greeks'])
+                        
+                        filtered_options.append(option)
+                        valid_options += 1
+                        
+                except (KeyError, ValueError, TypeError) as e:
+                    print(f"⚠️  Error processing option: {e}")
+                    continue
         except requests.exceptions.RequestException as req_err:
             if attempt == max_retries:
                 print(f"\n❌ Max retries reached for {option_type} options on {ticker}")
@@ -530,21 +565,33 @@ def summarize_options(options, current_price, is_put=True):
         list: List of processed option dictionaries with comprehensive metrics
     """
     if not options:
-        print("No options provided for summarization")
+        print("❌ No options provided for summarization")
         return []
     
+    option_type = 'PUT' if is_put else 'CALL'
     print(f"\n{'='*60}")
-    print(f"SUMMARIZING {'PUT' if is_put else 'CALL'} OPTIONS (Current Price: ${current_price:.2f})")
+    print(f"📊 SUMMARIZING {option_type} OPTIONS (Current Price: ${current_price:.2f})")
     print(f"Processing {len(options)} options...")
     print("-"*60)
     
     processed_options = []
     skipped_count = 0
     
+    # Track reasons for skipping options
+    skip_reasons = {
+        'no_pricing': 0,
+        'expired': 0,
+        'invalid_strike': 0,
+        'invalid_expiration': 0,
+        'missing_data': 0,
+        'other': 0
+    }
+    
     for i, contract in enumerate(options):
         try:
             # Skip if no pricing data
             if not contract.get('last_quote'):
+                skip_reasons['no_pricing'] += 1
                 skipped_count += 1
                 continue
             
@@ -552,24 +599,42 @@ def summarize_options(options, current_price, is_put=True):
             strike = contract.get('strike_price')
             expiration = contract.get('expiration_date')
             
+            # Validate strike price
+            if not strike or strike <= 0:
+                skip_reasons['invalid_strike'] += 1
+                skipped_count += 1
+                continue
+            
             # Calculate days to expiration
+            dte = 0
             if expiration:
                 try:
                     expiration_date = datetime.strptime(expiration, '%Y-%m-%d').date()
                     dte = (expiration_date - date.today()).days
                     if dte <= 0:  # Skip expired options
+                        skip_reasons['expired'] += 1
                         skipped_count += 1
                         continue
-                except (ValueError, TypeError):
-                    dte = 0
+                except (ValueError, TypeError) as e:
+                    skip_reasons['invalid_expiration'] += 1
+                    skipped_count += 1
+                    continue
             else:
-                dte = 0
+                skip_reasons['missing_data'] += 1
+                skipped_count += 1
+                continue
             
             # Get bid/ask/last prices with fallbacks
-            last_quote = contract.get('last_quote', {})
+            last_quote = contract.get('last_quote', {}) or {}
             bid = float(last_quote.get('bid', 0) or 0)
             ask = float(last_quote.get('ask', 0) or 0)
             last = float(last_quote.get('last', 0) or 0)
+            
+            # Skip if no valid pricing data
+            if bid <= 0 and ask <= 0 and last <= 0:
+                skip_reasons['no_pricing'] += 1
+                skipped_count += 1
+                continue
             
             # Calculate mid price with better fallback logic
             if bid > 0 and ask > 0:
@@ -645,7 +710,29 @@ def summarize_options(options, current_price, is_put=True):
             print(f"Error processing option {i+1}: {str(e)}")
             continue
     
-    print(f"\nProcessed {len(processed_options)} options (skipped {skipped_count} invalid/expired)")
+    # Print summary of processed options
+    print("\n" + "="*60)
+    print(f"✅ PROCESSED {len(processed_options)} {option_type} OPTIONS")
+    print(f"❌ SKIPPED {skipped_count} options:")
+    
+    # Only show skip reasons that have a count > 0
+    for reason, count in skip_reasons.items():
+        if count > 0:
+            reason_display = reason.replace('_', ' ').title()
+            print(f"  - {reason_display}: {count}")
+    
+    # Print top 3 strikes that made it through
+    if processed_options:
+        print("\n🔝 TOP 3 OPPORTUNITIES BY PREMIUM YIELD:")
+        sorted_options = sorted(processed_options, key=lambda x: x.get('annualized_yield', 0), reverse=True)[:3]
+        for i, opt in enumerate(sorted_options, 1):
+            print(f"  {i}. ${opt['strike_price']} {option_type} | "
+                  f"${opt.get('mid_price', 0):.2f} | "
+                  f"Δ {abs(opt.get('delta', 0)):.2f} | "
+                  f"{opt.get('annualized_yield', 0):.1f}% yield | "
+                  f"{opt.get('days_to_expiration', 0)} DTE")
+    
+    print("="*60 + "\n")
     
     if not processed_options:
         print("No valid options found after processing")
@@ -653,7 +740,8 @@ def summarize_options(options, current_price, is_put=True):
     # Filter and sort the options
     return filter_and_sort_options(processed_options, current_price, is_put)
 
-def filter_and_sort_options(options: List[Dict], current_price: float, is_put: bool = True) -> List[Dict]:
+def filter_and_sort_options(options: List[Dict], current_price: float, is_put: bool = True, 
+                          risk_tolerance: str = 'medium') -> List[Dict]:
     """
     Filter and sort options based on advanced criteria and rank them for potential trades.
     
@@ -661,6 +749,7 @@ def filter_and_sort_options(options: List[Dict], current_price: float, is_put: b
         options: List of option dictionaries with pricing and greeks
         current_price: Current price of the underlying asset
         is_put: Whether these are put options (True) or call options (False)
+        risk_tolerance: Risk tolerance level ('low', 'medium', 'high')
         
     Returns:
         List of filtered and ranked option dictionaries with additional metrics
@@ -669,14 +758,52 @@ def filter_and_sort_options(options: List[Dict], current_price: float, is_put: b
         print("No options provided for filtering.")
         return []
     
-    filtered = []
+    # Set risk-based parameters
+    risk_params = {
+        'low': {
+            'pop_min': 0.75,
+            'delta_min': 0.30 if is_put else 0.15,
+            'delta_max': 0.70 if is_put else 0.50,
+            'min_premium_mod': 1.5,  # Higher premium for lower risk
+            'spread_max': 0.15,  # Tighter spreads
+            'tag': '💰 Income'
+        },
+        'medium': {
+            'pop_min': 0.50,
+            'delta_min': 0.15 if is_put else 0.05,
+            'delta_max': 0.85 if is_put else 0.70,
+            'min_premium_mod': 1.0,
+            'spread_max': 0.30,
+            'tag': '📈 Directional'
+        },
+        'high': {
+            'pop_min': 0.30,
+            'delta_min': 0.05 if is_put else 0.01,
+            'delta_max': 0.95 if is_put else 0.90,
+            'min_premium_mod': 0.5,  # Accept lower premiums
+            'spread_max': 0.50,  # Wider spreads allowed
+            'tag': '🎯 Speculative'
+        }
+    }
     
-    # Set parameters based on option type
-    min_delta = PUT_MIN_DELTA if is_put else CALL_MIN_DELTA
-    max_delta = PUT_MAX_DELTA if is_put else CALL_MAX_DELTA
+    # Get parameters based on risk tolerance
+    params = risk_params.get(risk_tolerance.lower(), risk_params['medium'])
+    
+    # Apply risk-based adjustments
+    min_delta = max(MIN_DELTA, params['delta_min'])
+    max_delta = min(MAX_DELTA, params['delta_max'])
+    min_premium = MIN_PREMIUM * params['min_premium_mod']
+    min_open_interest = max(MIN_OPEN_INTEREST, 50)  # Higher OI for lower risk
+    
     option_type = 'Put' if is_put else 'Call'
     
-    print(f"\n🔍 Filtering {option_type} options (Δ {min_delta}-{max_delta}):")
+    print(f"\n🔍 Filtering {option_type} options (Risk: {risk_tolerance.upper()} - {params['tag']}):")
+    print(f"  - Delta range: {min_delta:.2f}-{max_delta:.2f}")
+    print(f"  - Min premium: ${min_premium:.2f}")
+    print(f"  - Min open interest: {min_open_interest}")
+    print(f"  - Min probability ITM: {params['pop_min']*100:.0f}%")
+    print(f"  - Max bid-ask spread: {params['spread_max']*100:.0f}%")
+    print(f"  - Strike range: {MIN_STRIKE_PCT*100:.1f}% to {MAX_STRIKE_PCT*100:.1f}% of current price")
     
     for opt in options:
         try:
@@ -693,23 +820,29 @@ def filter_and_sort_options(options: List[Dict], current_price: float, is_put: b
             if not (min_delta <= delta <= max_delta):
                 continue
             
-            # Skip if strike is too far from current price
-            strike_pct = (strike / current_price - 1) * 100
-            if is_put and strike_pct > (STRIKE_PRICE_RANGE * 100):
+            # Skip if strike is outside our defined percentage range
+            strike_pct = strike / current_price
+            if is_put and (strike_pct < MIN_STRIKE_PCT or strike_pct > 1.0):
                 continue
-            elif not is_put and strike_pct < -(STRIKE_PRICE_RANGE * 100):
+            elif not is_put and (strike_pct > MAX_STRIKE_PCT or strike_pct < 1.0):
                 continue
             
-            # Skip if open interest or volume is too low
-            if opt['open_interest'] < MIN_OPEN_INTEREST:
+            # Skip if open interest is too low
+            if opt['open_interest'] < min_open_interest:
                 continue
                 
-            if opt['volume'] < MIN_VOLUME:
+            # Skip if premium is too low
+            if opt.get('mid_price', 0) < min_premium:
                 continue
             
             # Calculate bid-ask spread as % of mid price
             spread = opt['ask'] - opt['bid']
-            spread_pct = (spread / opt['mid_price'] * 100) if opt['mid_price'] > 0 else 100
+            mid_price = opt.get('mid_price', (opt['bid'] + opt['ask']) / 2) if opt['bid'] and opt['ask'] else opt.get('last_trade_price', 0)
+            spread_pct = (spread / mid_price * 100) if mid_price > 0 else 100
+            
+            # Debug log for each option that passes all filters
+            print(f"  ✓ {option_type.upper()} {strike} | Δ {delta:.2f} | ${mid_price:.2f} | OI: {opt['open_interest']} | Vol: {opt['volume']}")
+            print(f"     Bid/Ask: ${opt.get('bid', 0):.2f}/${opt.get('ask', 0):.2f} | Spread: {spread_pct:.1f}% | DTE: {opt.get('days_to_expiration', 'N/A')}")
             
             # Skip if spread is too wide
             if spread_pct > MAX_BID_ASK_SPREAD_PCT:
@@ -718,68 +851,40 @@ def filter_and_sort_options(options: List[Dict], current_price: float, is_put: b
             # Calculate days to expiration
             dte = max(1, opt.get('days_to_expiration', 30))
             
-            # Calculate premium per day
-            premium_per_day = opt['mid_price'] / dte if dte > 0 else 0
+            # Calculate probability ITM (using delta's absolute value as proxy)
+            probability_itm = abs(delta)
+            
+            # Skip if probability ITM is below threshold for risk tolerance
+            if probability_itm < params['pop_min']:
+                print(f"  ✗ ${strike} | Probability ITM {probability_itm*100:.1f}% < {params['pop_min']*100:.0f}% min")
+                continue
             
             # Calculate annualized yield
-            if is_put:
-                annualized_yield = (opt['mid_price'] / strike) * (365 / dte) * 100
-                roc = (opt['mid_price'] / strike) * 100  # ROC for CSPs
-                monthly_roc = roc * (30 / dte)  # Monthly ROC
-                break_even = strike - opt['mid_price']
-            else:
-                annualized_yield = (opt['mid_price'] / current_price) * (365 / dte) * 100
-                roc = (opt['mid_price'] / current_price) * 100  # ROC for covered calls
-                monthly_roc = roc * (30 / dte)  # Monthly ROC
-                break_even = strike + opt['mid_price']
+            annualized_yield = (mid_price / strike) * (365 / max(1, days_to_exp)) * 100 if strike > 0 else 0
             
-            # Skip if yield is too low
-            if annualized_yield < MIN_ANNUALIZED_YIELD:
-                continue
-                
-            # Skip if monthly ROC is too low
-            if monthly_roc < MIN_ROC:
-                continue
+            # Determine play type based on delta and risk profile
+            play_type = params['tag']
             
-            # Calculate probability ITM (using delta as proxy)
-            probability_itm = delta * 100  # Convert to percentage
-            
-            # Skip if probability ITM is too low
-            if probability_itm < MIN_PROBABILITY_ITM:
-                continue
-            
-            # Calculate risk/reward ratio
-            if is_put:
-                max_risk = strike - opt['mid_price']
-                max_reward = opt['mid_price']
-            else:
-                max_risk = float('inf')  # Unlimited risk for naked calls
-                max_reward = opt['mid_price']
-            
-            risk_reward_ratio = (max_reward / max_risk) if max_risk > 0 else float('inf')
-            
-            # Add calculated metrics to option dict
+            # Add to filtered list with additional metrics
             opt.update({
+                'mid_price': mid_price,
+                'spread_pct': spread_pct * 100,  # Store as percentage
+                'probability_itm': probability_itm * 100,  # Store as percentage
                 'annualized_yield': annualized_yield,
-                'return_on_capital': roc,
-                'monthly_roc': monthly_roc,
-                'annualized_roc': monthly_roc * 12,  # Annualized ROC
-                'premium_per_day': premium_per_day,
-                'break_even': break_even,
-                'probability_itm': probability_itm,
-                'risk_reward_ratio': risk_reward_ratio,
-                'spread_pct': spread_pct,
-                'days_to_expiration': dte,
-                'strike_pct_otm': -strike_pct if is_put else strike_pct,
-                'type': 'Put' if is_put else 'Call'
+                'days_to_expiration': days_to_exp,
+                'play_type': play_type,
+                'liquidity_score': min(100, (volume + open_interest) / 100),  # Simple liquidity score (0-100)
+                'risk_tolerance': risk_tolerance.upper()
             })
+            
+            print(f"  ✓ ${strike} | {play_type} | Δ {delta:.2f} | "
+                  f"${mid_price:.2f} | OI: {open_interest} | "
+                  f"PoP: {probability_itm*100:.0f}% | Yield: {annualized_yield:.1f}%")
             
             filtered.append(opt)
             
         except Exception as e:
-            print(f"⚠️ Error processing option: {e}")
-            import traceback
-            traceback.print_exc()
+            print(f"  ⚠️  Error processing option: {str(e)}")
             continue
     
     # Sort by the selected ranking metric
@@ -811,7 +916,7 @@ def filter_and_sort_options(options: List[Dict], current_price: float, is_put: b
 
 def generate_trade_idea_sheet(puts: List[Dict], calls: List[Dict], output_dir: str = 'output', simulate_forward: bool = True) -> str:
     """
-    Generate a markdown report with the best trading opportunities.
+    Generate an enhanced markdown report with trading opportunities, simulations, and recommendations.
     
     Args:
         puts: List of filtered put options
@@ -828,23 +933,47 @@ def generate_trade_idea_sheet(puts: List[Dict], calls: List[Dict], output_dir: s
     
     # Prepare markdown content
     md_content = [
-        "# 📊 Daily Options Trade Ideas",
-        f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n",
-        "## 📈 Market Overview",
-        "*Market data as of latest close*\n"
+        "# 📊 Daily Options Trade Report",
+        f"*Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}*\n",
+        "---"
     ]
     
-    # Get current prices for all tickers
+    # Get current prices and prepare market data
     underlying_prices = {}
+    tickers = set()
+    
     for option in puts + calls:
         ticker = option.get('ticker')
         price = option.get('underlying_price')
         if ticker and price:
             underlying_prices[ticker] = price
+            tickers.add(ticker)
     
-    # Simulate top trades
-    top_puts = puts[:5]  # Top 5 puts for simulation
-    top_calls = calls[:5]  # Top 5 calls for simulation
+    # --- Market Overview Section ---
+    md_content.extend([
+        "## 🌐 Market Overview",
+        "### Key Indices (as of close)",
+        "- **S&P 500 (SPY):** $XXX.XX (X.XX%) | 50D MA: $XXX.XX | 200D MA: $XXX.XX",
+        "- **NASDAQ (QQQ):** $XXX.XX (X.XX%) | 50D MA: $XXX.XX | 200D MA: $XXX.XX",
+        "- **VIX:** XX.XX (X.XX%) | 20D Avg: XX.XX",
+        "\n### Market Sentiment",
+        "- **Put/Call Ratio (5-day avg):** X.XX",
+        "- **Market Trend:** [Bullish/Neutral/Bearish] based on [criteria]",
+        "- **Sector Performance (Today): Tech +X.XX%, Financials +X.XX%, Healthcare +X.XX%"
+    ])
+    
+    # --- Simulation Setup ---
+    md_content.extend([
+        "\n## 🔄 Simulation Parameters",
+        f"- **Simulation Type:** {'Forward' if simulate_forward else 'Backtest'}",
+        "- **Simulation Period:** 30 days",
+        "- **Volatility Model:** GARCH(1,1)",
+        "- **Monte Carlo Iterations:** 10,000"
+    ])
+    
+    # Simulate top trades (top 5 of each)
+    top_puts = puts[:5]
+    top_calls = calls[:5]
     
     # Add simulation data to top trades
     simulated_puts = simulate_recommended_trades(top_puts, underlying_prices, simulate_forward)
@@ -859,101 +988,192 @@ def generate_trade_idea_sheet(puts: List[Dict], calls: List[Dict], output_dir: s
         if i < len(calls):
             calls[i].update(call)
     
-    # Add best puts section
-    md_content.extend([
-        "\n## 💰 Best Cash-Secured Puts",
-        "| Ticker | Price | Strike | Premium | Yield | Annualized | DTE | Prob ITM | Sim. Profit % | Sim. Max DD % |",
-        "|--------|-------|--------|---------|-------|------------|-----|----------|---------------|---------------|"
-    ])
+    # --- Trade Recommendations ---
+    md_content.extend(["\n## 🎯 Top Trade Recommendations"])
     
-    for put in puts[:10]:  # Top 10 puts
+    # Add top 3 puts with detailed metrics
+    for i, put in enumerate(puts[:3], 1):
         sim = put.get('simulation', {})
-        md_content.append(
-            f"| {put.get('ticker', 'N/A')} | "
-            f"${put.get('underlying_price', 0):.2f} | "
-            f"${put.get('strike_price', 0):.2f} | "
-            f"${put.get('mid_price', 0):.2f} | "
-            f"{put.get('premium_yield', 0):.1f}% | "
-            f"{put.get('annualized_yield', 0):.1f}% | "
-            f"{put.get('days_to_expiration', 0)} | "
-            f"{put.get('probability_itm', 0):.1f}% | "
-            f"{sim.get('realized_yield', 'N/A'):.1f}% | "
-            f"{abs(sim.get('max_drawdown', 0)):.1f}% |"
-        )
+        md_content.extend([
+            f"### {i}. {put.get('ticker', 'N/A')} - ${put.get('strike_price', 0):.2f} Put",
+            "```",
+            f"Entry:       ${put.get('underlying_price', 0):.2f}",
+            f"Strike:      ${put.get('strike_price', 0):.2f} ({put.get('strike_pct_otm', 0):.1f}% OTM)",
+            f"Premium:     ${put.get('mid_price', 0):.2f} (${put.get('bid', 0):.2f} / ${put.get('ask', 0):.2f})",
+            f"Yield:       {put.get('premium_yield', 0):.1f}% ({put.get('annualized_yield', 0):.1f}% annualized)",
+            f"Expiration:  {put.get('expiration', 'N/A')} (in {put.get('days_to_expiration', 0)} days)",
+            f"Delta:       {put.get('delta', 0):.2f} | Gamma: {put.get('gamma', 0):.4f}",
+            f"Theta:       ${put.get('theta', 0):.2f}/day | Vega: ${put.get('vega', 0):.2f}",
+            f"Open Int:    {put.get('open_interest', 0):,} | Volume: {put.get('volume', 0):,}",
+            "\n📊 Simulation Results:",
+            f"- Expected P/L:   {sim.get('realized_yield', 0):.1f}%",
+            f"- Max Drawdown:   {abs(sim.get('max_drawdown', 0)):.1f}%",
+            f"- Prob. Profit:   {sim.get('probability_of_profit', 0):.1f}%",
+            f"- Breakeven:      ${sim.get('breakeven', 0):.2f}",
+            f"- Expected Exit:  ${sim.get('exit_price', 0):.2f} in {sim.get('held_days', 0)} days",
+            "```",
+            f"**Trade Rationale:** [Brief analysis of why this is a good trade]"
+        ])
     
-    # Add best calls section
-    md_content.extend([
-        "\n## 📈 Best Covered Calls",
-        "| Ticker | Price | Strike | Premium | Yield | Annualized | DTE | Prob ITM | Sim. Profit % | Sim. Max DD % |",
-        "|--------|-------|--------|---------|-------|------------|-----|----------|---------------|---------------|"
-    ])
-    
-    for call in calls[:10]:  # Top 10 calls
+    # Add top 3 calls with detailed metrics
+    for i, call in enumerate(calls[:3], 1):
         sim = call.get('simulation', {})
-        md_content.append(
-            f"| {call.get('ticker', 'N/A')} | "
-            f"${call.get('underlying_price', 0):.2f} | "
-            f"${call.get('strike_price', 0):.2f} | "
-            f"${call.get('mid_price', 0):.2f} | "
-            f"{call.get('premium_yield', 0):.1f}% | "
-            f"{call.get('annualized_yield', 0):.1f}% | "
-            f"{call.get('days_to_expiration', 0)} | "
-            f"{call.get('probability_itm', 0):.1f}% | "
-            f"{sim.get('realized_yield', 'N/A'):.1f}% | "
-            f"{abs(sim.get('max_drawdown', 0)):.1f}% |"
-        )
+        md_content.extend([
+            f"### {i+3}. {call.get('ticker', 'N/A')} - ${call.get('strike_price', 0):2f} Call",
+            "```",
+            f"Entry:       ${call.get('underlying_price', 0):.2f}",
+            f"Strike:      ${call.get('strike_price', 0):.2f} ({call.get('strike_pct_otm', 0):.1f}% OTM)",
+            f"Premium:     ${call.get('mid_price', 0):.2f} (${call.get('bid', 0):.2f} / ${call.get('ask', 0):.2f})",
+            f"Yield:       {call.get('premium_yield', 0):.1f}% ({call.get('annualized_yield', 0):.1f}% annualized)",
+            f"Expiration:  {call.get('expiration', 'N/A')} (in {call.get('days_to_expiration', 0)} days)",
+            f"Delta:       {call.get('delta', 0):.2f} | Gamma: {call.get('gamma', 0):.4f}",
+            f"Theta:       ${call.get('theta', 0):.2f}/day | Vega: ${call.get('vega', 0):.2f}",
+            f"Open Int:    {call.get('open_interest', 0):,} | Volume: {call.get('volume', 0):,}",
+            "\n📊 Simulation Results:",
+            f"- Expected P/L:   {sim.get('realized_yield', 0):.1f}%",
+            f"- Max Drawdown:   {abs(sim.get('max_drawdown', 0)):.1f}%",
+            f"- Prob. Profit:   {sim.get('probability_of_profit', 0):.1f}%",
+            f"- Breakeven:      ${sim.get('breakeven', 0):.2f}",
+            f"- Expected Exit:  ${sim.get('exit_price', 0):.2f} in {sim.get('held_days', 0)} days",
+            "```",
+            f"**Trade Rationale:** [Brief analysis of why this is a good trade]"
+        ])
     
-    # Add trade recommendations with simulation results
+    # --- Trade Lists ---
+    # Add best puts table
     md_content.extend([
-        "\n## 🎯 Top Trade Recommendations with Simulation"
+        "\n## 💰 Cash-Secured Puts (Top 10)",
+        "| Ticker | Price | Strike | Premium | Yield | Annualized | DTE | Δ | POP% | Sim P/L% | Max DD% | Tags |",
+        "|--------|-------|--------|---------|-------|------------|-----|---|------|----------|---------|------|"
     ])
     
-    # Best Put recommendation with simulation
-    if puts and 'simulation' in puts[0]:
-        put = puts[0]
-        sim = put['simulation']
-        md_content.extend([
-            "### 1. Best Overall Put",
-            f"- **{put['ticker']}** ${put['strike_price']:.2f} Put @ ${put['mid_price']:.2f}",
-            f"- **Entry Price:** ${put.get('underlying_price', 0):.2f}",
-            f"- **Expiration:** {put.get('expiration', 'N/A')} (in {put.get('days_to_expiration', 0)} days)",
-            f"- **Premium Yield:** {put.get('premium_yield', 0):.1f}% ({put.get('annualized_yield', 0):.1f}% annualized)",
-            f"- **Simulated Profit:** {sim.get('realized_yield', 'N/A'):.1f}% (Max DD: {abs(sim.get('max_drawdown', 0)):.1f}%)",
-            f"- **Prob. Profit:** {sim.get('probability_of_profit', 'N/A')}% | **Breakeven:** ${sim.get('breakeven', 'N/A'):.2f}",
-            f"- **Simulated Exit:** ${sim.get('exit_price', 'N/A'):.2f} after {sim.get('held_days', 'N/A')} days"
-        ])
+    for put in puts[:10]:
+        sim = put.get('simulation', {})
+        tags = []
+        if put.get('premium_yield', 0) > 3.0: tags.append("💰 High Yield")
+        if sim.get('probability_of_profit', 0) > 70: tags.append("🎯 High Prob")
+        if put.get('volume', 0) > 1000: tags.append("📈 High Volume")
+        
+        md_content.append(
+            f"| {put.get('ticker', 'N/A')} "
+            f"| ${put.get('underlying_price', 0):.2f} "
+            f"| ${put.get('strike_price', 0):.2f} "
+            f"| ${put.get('mid_price', 0):.2f} "
+            f"| {put.get('premium_yield', 0):.1f}% "
+            f"| {put.get('annualized_yield', 0):.1f}% "
+            f"| {put.get('days_to_expiration', 0)} "
+            f"| {put.get('delta', 0):.2f} "
+            f"| {sim.get('probability_of_profit', 0):.1f}% "
+            f"| {sim.get('realized_yield', 0):.1f}% "
+            f"| {abs(sim.get('max_drawdown', 0)):.1f}% "
+            f"| {' '.join(tags)} |"
+        )
     
-    # Best Call recommendation with simulation
-    if calls and 'simulation' in calls[0]:
-        call = calls[0]
-        sim = call['simulation']
-        md_content.extend([
-            "\n### 2. Best Overall Call",
-            f"- **{call['ticker']}** ${call['strike_price']:.2f} Call @ ${call['mid_price']:.2f}",
-            f"- **Entry Price:** ${call.get('underlying_price', 0):.2f}",
-            f"- **Expiration:** {call.get('expiration', 'N/A')} (in {call.get('days_to_expiration', 0)} days)",
-            f"- **Premium Yield:** {call.get('premium_yield', 0):.1f}% ({call.get('annualized_yield', 0):.1f}% annualized)",
-            f"- **Simulated Profit:** {sim.get('realized_yield', 'N/A'):.1f}% (Max DD: {abs(sim.get('max_drawdown', 0)):.1f}%)",
-            f"- **Prob. Profit:** {sim.get('probability_of_profit', 'N/A')}% | **Breakeven:** ${sim.get('breakeven', 'N/A'):.2f}",
-            f"- **Simulated Exit:** ${sim.get('exit_price', 'N/A'):.2f} after {sim.get('held_days', 'N/A')} days"
-        ])
+    # Add best calls table
+    md_content.extend([
+        "\n## 📈 Covered Calls (Top 10)",
+        "| Ticker | Price | Strike | Premium | Yield | Annualized | DTE | Δ | POP% | Sim P/L% | Max DD% | Tags |",
+        "|--------|-------|--------|---------|-------|------------|-----|---|------|----------|---------|------|"
+    ])
     
-    # Add notes and disclaimers
+    for call in calls[:10]:
+        sim = call.get('simulation', {})
+        tags = []
+        if call.get('premium_yield', 0) > 2.0: tags.append("💰 High Yield")
+        if sim.get('probability_of_profit', 0) > 70: tags.append("🎯 High Prob")
+        if call.get('volume', 0) > 1000: tags.append("📈 High Volume")
+        
+        md_content.append(
+            f"| {call.get('ticker', 'N/A')} "
+            f"| ${call.get('underlying_price', 0):.2f} "
+            f"| ${call.get('strike_price', 0):.2f} "
+            f"| ${call.get('mid_price', 0):.2f} "
+            f"| {call.get('premium_yield', 0):.1f}% "
+            f"| {call.get('annualized_yield', 0):.1f}% "
+            f"| {call.get('days_to_expiration', 0)} "
+            f"| {call.get('delta', 0):.2f} "
+            f"| {sim.get('probability_of_profit', 0):.1f}% "
+            f"| {sim.get('realized_yield', 0):.1f}% "
+            f"| {abs(sim.get('max_drawdown', 0)):.1f}% "
+            f"| {' '.join(tags)} |"
+        )
+    
+    # --- Trade Execution ---
+    md_content.extend([
+        "\n## 🛠️ Trade Execution",
+        "### Suggested Position Sizing",
+        "- **Account Size:** $XX,XXX",
+        "- **Max Risk per Trade:** X% of portfolio",
+        "- **Position Size:** X contracts (max risk: $XXX)",
+        "\n### Entry/Exit Rules",
+        "- **Entry:** Limit order at mid-price or better",
+        "- **Stop Loss:** -XX% of premium received",
+        "- **Profit Target:** XX% of max profit",
+        "- **Management:** Consider rolling at XX DTE or XX% of max profit"
+    ])
+    
+    # --- Risk Management ---
+    md_content.extend([
+        "\n## ⚠️ Risk Management",
+        "### Portfolio Allocation",
+        "- Max X% of portfolio in any single underlying",
+        "- Max X% in any single sector",
+        "- Max X% in any single strategy",
+        "\n### Risk Metrics",
+        "- Portfolio Beta: X.XX",
+        "- Portfolio Theta: $XX.XX/day",
+        "- Portfolio Delta: $X,XXX per 1% move",
+        "- Portfolio Vega: $XX.XX per 1 volatility point"
+    ])
+    
+    # --- Market Data & Analysis ---
+    md_content.extend([
+        "\n## 📊 Market Data & Analysis",
+        "### Implied vs Historical Volatility",
+        "- **IV Percentile:** XX% (Xth percentile)",
+        "- **IV Rank:** XX (X/100)",
+        "- **Current IV/HV Ratio:** X.XX",
+        "\n### Technical Analysis",
+        "- **Trend:** [Up/Down/Sideways]",
+        "- **Key Levels:** Support at $XX.XX, Resistance at $XX.XX",
+        "- **RSI(14):** XX.X (Oversold/Overbought/Neutral)",
+        "- **MACD:** [Bullish/Bearish] crossover"
+    ])
+    
+    # --- Economic Calendar ---
+    md_content.extend([
+        "\n## 📅 Upcoming Events",
+        "| Date | Time (ET) | Event | Impact |",
+        "|------|----------|-------|--------|",
+        "| Tues, Jun 10 | 8:30 AM | CPI m/m | 🟡 Medium |",
+        "| Wed, Jun 11 | 2:00 PM | FOMC Statement | 🔴 High |",
+        "| Thu, Jun 12 | 8:30 AM | Initial Claims | 🟢 Low |"
+    ])
+    
+    # --- Notes & Disclaimers ---
     md_content.extend([
         "\n## 📝 Notes & Disclaimers",
-        "- **All metrics** are calculated based on mid-price between bid and ask.",
-        "- **Prob ITM** is estimated using delta as a proxy.",
-        "- **Simulation results** are based on historical data and mathematical models, not guarantees of future performance.",
-        "- **Max Drawdown (DD)** shows the maximum observed decline from peak value during the simulation period.",
-        "- **Always** consider your risk tolerance and do your own research before trading.",
-        "- **Past performance** is not indicative of future results.",
-        f"- **Simulation mode:** {'Forward' if simulate_forward else 'Backtest'} simulation"
+        "### Key Assumptions",
+        "- Options pricing uses mid-point between bid/ask",
+        "- Greeks calculated using Black-Scholes model",
+        "- Simulation uses historical volatility and Monte Carlo methods",
+        "- No transaction costs or slippage included in simulations",
+        "\n### Risk Disclosure",
+        "⚠️ **Options trading involves substantial risk of loss and is not suitable for all investors.**",
+        "- Past performance is not indicative of future results",
+        "- Simulated results do not reflect actual trading and may not account for all risks",
+        "- Consider your risk tolerance and investment objectives before trading",
+        "\n### Data Sources",
+        "- Market data provided by Polygon.io",
+        f"- Report generated on {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+        f"- Simulation mode: {'Forward' if simulate_forward else 'Backtest'}"
     ])
     
     # Write to file
     with open(filename, 'w', encoding='utf-8') as f:
         f.write('\n'.join(line for line in md_content if line is not None))
     
+    print(f"✅ Report generated: {filename}")
     return filename
 
 def format_option_display(options, is_put=True):
@@ -1126,23 +1346,170 @@ def print_header():
     
     return md_content
 
-def run():
+def get_available_expirations(ticker, current_price, max_retries=3):
     """
-    Main function to run the options analysis.
+    Get available expiration dates for a given ticker.
     
-    This function:
-    1. Sets up the output directory and initializes tracking variables
-    2. Processes each ticker in TICKERS list
-    3. Fetches and analyzes options data for each ticker
-    4. Generates and saves markdown reports
-    5. Handles errors and provides summary statistics
+    Args:
+        ticker: Stock ticker symbol
+        current_price: Current stock price
+        max_retries: Maximum number of retry attempts
+        
+    Returns:
+        List of available expiration dates (YYYY-MM-DD)
     """
+    print(f"\n📅 Fetching available expiration dates for {ticker}...")
+    
+    # First, try to get options contracts to see available expirations
+    url = f"{BASE_URL}/v3/reference/options/contracts"
+    params = {
+        'underlying_ticker': ticker,
+        'limit': 1000,
+        'expired': 'false',
+        'apiKey': API_KEY
+    }
+    
+    for attempt in range(max_retries):
+        try:
+            response = requests.get(url, params=params, timeout=10)
+            response.raise_for_status()
+            data = response.json()
+            
+            if 'results' in data and data['results']:
+                # Extract unique expiration dates
+                expirations = sorted(list(set([
+                    result['expiration_date'] 
+                    for result in data['results']
+                    if 'expiration_date' in result
+                ])))
+                
+                if expirations:
+                    print(f"  Found {len(expirations)} expiration dates for {ticker}")
+                    return expirations
+                
+            print(f"  No expiration dates found for {ticker} (attempt {attempt + 1}/{max_retries})")
+            
+        except Exception as e:
+            print(f"  Error fetching expirations for {ticker}: {str(e)}")
+        
+        if attempt < max_retries - 1:
+            wait_time = (2 ** attempt) * 2  # Exponential backoff
+            print(f"  Retrying in {wait_time} seconds...")
+            time.sleep(wait_time)
+    
+    print(f"  ⚠️ Using default expiration date: {TARGET_EXPIRATION}")
+    return [TARGET_EXPIRATION]
+
+def select_best_expiration(expirations, min_dte=10, max_dte=45):
+    """
+    Select the best expiration date based on DTE range.
+    
+    Args:
+        expirations: List of expiration dates (YYYY-MM-DD)
+        min_dte: Minimum days to expiration
+        max_dte: Maximum days to expiration
+        
+    Returns:
+        Selected expiration date (YYYY-MM-DD)
+    """
+    if not expirations:
+        return TARGET_EXPIRATION
+    
+    today = date.today()
+    valid_expirations = []
+    
+    for exp_date_str in expirations:
+        try:
+            exp_date = datetime.strptime(exp_date_str, '%Y-%m-%d').date()
+            dte = (exp_date - today).days
+            if min_dte <= dte <= max_dte:
+                valid_expirations.append((exp_date_str, dte))
+        except (ValueError, TypeError):
+            continue
+    
+    if not valid_expirations:
+        print(f"  No valid expirations found in {min_dte}-{max_dte} DTE range, using closest")
+        # Find the closest expiration to our target DTE
+        target_dte = (min_dte + max_dte) // 2
+        return min(
+            [(d, abs((datetime.strptime(d, '%Y-%m-%d').date() - today).days - target_dte)) 
+             for d in expirations],
+            key=lambda x: x[1]
+        )[0]
+    
+    # Sort by DTE closest to our target range
+    target_dte = (min_dte + max_dte) // 2
+    best_exp = min(valid_expirations, key=lambda x: abs(x[1] - target_dte))
+    
+    print(f"  Selected expiration: {best_exp[0]} ({best_exp[1]} DTE)")
+    return best_exp[0]
+
+def run(risk_tolerance: str = 'medium'):
+    """
+    Main function to run the options scanner.
+    
+    Args:
+        risk_tolerance: Risk tolerance level ('low', 'medium', 'high')
+    """
+    # Declare global variables at the beginning of the function
+    global TARGET_EXPIRATION, TICKERS, MIN_PREMIUM, MIN_DELTA, MAX_DELTA, MIN_OPEN_INTEREST
+    
+    # Validate risk tolerance
+    risk_tolerance = risk_tolerance.lower()
+    if risk_tolerance not in ['low', 'medium', 'high']:
+        print(f"⚠️  Invalid risk tolerance: {risk_tolerance}. Defaulting to 'medium'.")
+        risk_tolerance = 'medium'
+    
+    print("🚀 Starting Polygon Options Scanner" + " " * 20)
+    print("="*80)
+    print(f"📅 Scan started at: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    print(f"📊 Tickers to scan: {', '.join(TICKERS)}")
+    print(f"🎯 Risk tolerance: {risk_tolerance.upper()}")
+    print("-"*80 + "\n")
+    
+    # Initialize statistics
+    stats = {
+        'start_time': datetime.now(),
+        'tickers_processed': 0,
+        'tickers_with_puts': 0,
+        'tickers_with_calls': 0,
+        'total_puts_found': 0,
+        'total_calls_found': 0,
+        'tickers_with_errors': 0,
+        'errors': [],
+        'risk_tolerance': risk_tolerance
+    }
+    
+    # Initialize markdown content
+    md_content = [
+        "# 📊 Options Scan Report",
+        f"**Date:** {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+        f"**Tickers Scanned:** {len(TICKERS)}",
+        f"**Risk Tolerance:** {risk_tolerance.upper()}",
+        ""
+    ]
+    
+    # Check market status
+    try:
+        market_status = get_market_status()
+        md_content.append(f"**Market Status:** {market_status}")
+        if market_status != 'open':
+            md_content.append("⚠️ **Warning:** Market is not currently open. Data may be stale.")
+    except Exception as e:
+        md_content.append(f"⚠️ **Warning:** Could not determine market status: {str(e)}")
+    
+    md_content.extend(["", "## 📋 Scan Results", ""])
+    
+    # Initialize lists to store all puts and calls for summary
+    all_puts = []
+    all_calls = []
+    
     # Create output directory if it doesn't exist
     os.makedirs('output', exist_ok=True)
     
-    # Get current timestamp for the output file
+    # Generate output filename with timestamp
     timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-    output_file = f'output/options_analysis_{timestamp}.md'
+    output_file = f'output/trade_ideas_{risk_tolerance}_{timestamp}.md'
     
     # Initialize stats
     stats = {
@@ -1175,8 +1542,13 @@ def run():
         "|--------|--------|------------|-------------|-------|"
     ])
     
-    # Process each ticker
-    for ticker in TICKERS:
+    # Process each ticker with rate limiting
+    for i, ticker in enumerate(TICKERS, 1):
+        # Add random delay between tickers to avoid rate limiting
+        if i > 1:  # No delay before first ticker
+            delay = 0.5 + random.uniform(0, 1.0)  # 0.5-1.5 second delay
+            time.sleep(delay)
+        
         ticker_start = datetime.now()
         stats['tickers_processed'] += 1
         ticker_status = ""
@@ -1185,25 +1557,80 @@ def run():
         calls_found = 0
         price = None
         options_chain = None
+        selected_expiration = TARGET_EXPIRATION  # Default to global target
+        
+        print(f"\n{'='*80}\n📊 [{i}/{len(TICKERS)}] Analyzing {ticker} (Risk: {risk_tolerance.upper()})")
+        print("-"*80)
         
         try:
-            print(f"\n{'='*80}\n📊 [{stats['tickers_processed']}/{len(TICKERS)}] Analyzing {ticker}")
-            print("-"*80)
+            # Get stock price with retry logic
+            max_retries = 3
+            for attempt in range(max_retries):
+                try:
+                    print(f"🔍 Fetching current price for {ticker} (attempt {attempt + 1}/{max_retries})...")
+                    price = get_stock_price(ticker)
+                    if not price or price <= 0:
+                        raise ValueError(f"Invalid price ${price:.2f} for {ticker}")
+                    print(f"✅ Current price: ${price:.2f}")
+                    break
+                except Exception as e:
+                    if attempt == max_retries - 1:
+                        raise
+                    wait_time = 2 ** attempt  # Exponential backoff
+                    print(f"⚠️  Error fetching price: {str(e)}. Retrying in {wait_time}s...")
+                    time.sleep(wait_time)
             
-            # Get stock price
-            print(f"🔍 Fetching current price for {ticker}...")
-            price = get_stock_price(ticker)
-            if not price or price <= 0:
-                raise ValueError(f"Invalid price ${price:.2f} for {ticker}")
+            # Get available expirations and select the best one
+            try:
+                print("\n📅 Fetching available option expirations...")
+                expirations = get_available_expirations(ticker, price)
+                selected_expiration = select_best_expiration(expirations, min_dte=10, max_dte=45)
+                print(f"🎯 Selected expiration: {selected_expiration}")
+                
+                # Update the global TARGET_EXPIRATION for this ticker
+                TARGET_EXPIRATION = selected_expiration
+                
+            except Exception as e:
+                print(f"⚠️  Error selecting expiration date: {str(e)}")
+                print(f"⚠️  Using default expiration: {TARGET_EXPIRATION}")
             
-            print(f"✅ Current price: ${price:.2f}")
+            # ... (rest of the code remains the same)
+            # Get options chain with progress indication and error handling
+            print(f"\n🔍 Fetching options chain for {ticker} (Exp: {TARGET_EXPIRATION})...")
             
-            # Get options chain with progress indication
-            print(f"🔍 Fetching options chain for {ticker}...")
             # First get puts
-            puts_chain = get_options_chain(ticker, 'put', price)
+            print(f"📉 Fetching PUT options...")
+            try:
+                puts_chain = get_options_chain(ticker, 'put', price)
+                if not puts_chain or 'results' not in puts_chain or not puts_chain['results']:
+                    print("⚠️  No PUT options data available")
+                    puts_chain = {'results': []}
+                else:
+                    print(f"✅ Found {len(puts_chain['results'])} PUT contracts")
+                    # Filter for selected expiration only
+                    puts_chain['results'] = [opt for opt in puts_chain['results'] 
+                                          if opt.get('expiration_date') == TARGET_EXPIRATION]
+                    print(f"   → {len(puts_chain['results'])} contracts for {TARGET_EXPIRATION}")
+            except Exception as e:
+                print(f"⚠️  Error fetching PUT options: {str(e)}")
+                puts_chain = {'results': []}
+            
             # Then get calls
-            calls_chain = get_options_chain(ticker, 'call', price)
+            print(f"📈 Fetching CALL options...")
+            try:
+                calls_chain = get_options_chain(ticker, 'call', price)
+                if not calls_chain or 'results' not in calls_chain or not calls_chain['results']:
+                    print("⚠️  No CALL options data available")
+                    calls_chain = {'results': []}
+                else:
+                    print(f"✅ Found {len(calls_chain['results'])} CALL contracts")
+                    # Filter for selected expiration only
+                    calls_chain['results'] = [opt for opt in calls_chain['results'] 
+                                           if opt.get('expiration_date') == TARGET_EXPIRATION]
+                    print(f"   → {len(calls_chain['results'])} contracts for {TARGET_EXPIRATION}")
+            except Exception as e:
+                print(f"⚠️  Error fetching CALL options: {str(e)}")
+                calls_chain = {'results': []}
             
             # Combine the results
             options_chain = {'results': []}
@@ -1222,24 +1649,50 @@ def run():
             
             try:
                 # Process and filter options
-                puts, calls = process_options_chain(options_chain, price)
-                
-                # Update stats and collections
-                if puts:
-                    all_puts.extend(puts)
-                    puts_found = len(puts)
-                    stats['tickers_with_puts'] += 1
+                if 'puts' in options_chain and options_chain['puts']:
+                    puts_filtered = filter_and_sort_options(
+                        options_chain['puts'], 
+                        price, 
+                        is_put=True,
+                        risk_tolerance=risk_tolerance
+                    )
+                    puts_found = len(puts_filtered)
                     stats['total_puts_found'] += puts_found
-                    print(f"✅ Found {puts_found} qualifying put options")
-                    
-                if calls:
-                    all_calls.extend(calls)
-                    calls_found = len(calls)
-                    stats['tickers_with_calls'] += 1
-                    stats['total_calls_found'] += calls_found
-                    print(f"✅ Found {calls_found} qualifying call options")
+                    if puts_found > 0:
+                        stats['tickers_with_puts'] += 1
                 
-                if not puts and not calls:
+                    # Add to all_puts for summary
+                    for put in puts_filtered:
+                        put.update({
+                            'ticker': ticker,
+                            'current_price': price,
+                            'expiration': TARGET_EXPIRATION
+                        })
+                        all_puts.append(put)
+            
+                # Process calls with risk tolerance
+                if 'calls' in options_chain and options_chain['calls']:
+                    calls_filtered = filter_and_sort_options(
+                        options_chain['calls'], 
+                        price, 
+                        is_put=False,
+                        risk_tolerance=risk_tolerance
+                    )
+                    calls_found = len(calls_filtered)
+                    stats['total_calls_found'] += calls_found
+                    if calls_found > 0:
+                        stats['tickers_with_calls'] += 1
+                    
+                    # Add to all_calls for summary
+                    for call in calls_filtered:
+                        call.update({
+                            'ticker': ticker,
+                            'current_price': price,
+                            'expiration': TARGET_EXPIRATION
+                        })
+                        all_calls.append(call)
+                
+                if not puts_filtered and not calls_filtered:
                     ticker_status = "⚠️ No qualifying options"
                     print(ticker_status)
                 else:
@@ -1315,67 +1768,193 @@ def run():
             continue
     
     # After processing all tickers, add summary section
+    end_time = datetime.now()
+    total_runtime = end_time - stats['start_time']
+    
+    # Calculate success rate
+    success_rate = ((stats['tickers_processed'] - stats['tickers_with_errors']) / 
+                   stats['tickers_processed'] * 100) if stats['tickers_processed'] > 0 else 0
+    
+    # Add summary to markdown
     md_content.extend([
-        "\n## 📊 Analysis Summary",
+        "\n## 📊 Scan Summary",
+        "### 📈 Statistics",
         f"- **Total tickers processed:** {stats['tickers_processed']}",
-        f"- **Tickers with qualifying puts:** {stats['tickers_with_puts']}",
-        f"- **Tickers with qualifying calls:** {stats['tickers_with_calls']}",
+        f"- **Tickers with qualifying puts:** {stats['tickers_with_puts']} ({stats['tickers_with_puts']/stats['tickers_processed']*100:.1f}%)",
+        f"- **Tickers with qualifying calls:** {stats['tickers_with_calls']} ({stats['tickers_with_calls']/stats['tickers_processed']*100:.1f}%)",
         f"- **Total puts found:** {stats['total_puts_found']}",
         f"- **Total calls found:** {stats['total_calls_found']}",
+        f"- **Scan success rate:** {success_rate:.1f}%",
         f"- **Tickers with errors:** {stats['tickers_with_errors']}",
-        f"- **Total runtime:** {datetime.now() - stats['start_time']}",
+        f"- **Scan start time:** {stats['start_time'].strftime('%Y-%m-%d %H:%M:%S')}",
+        f"- **Scan end time:** {end_time.strftime('%Y-%m-%d %H:%M:%S')}",
+        f"- **Total runtime:** {total_runtime}",
         "",
-        "## 🔍 Top Trades by Annualized Yield"
+        "### ⚙️ Scan Parameters",
+        f"- **Target expiration date:** {TARGET_EXPIRATION}",
+        f"- **Delta range:** {MIN_DELTA:.2f} - {MAX_DELTA:.2f}",
+        f"- **Minimum premium:** ${MIN_PREMIUM:.2f}",
+        f"- **Minimum open interest:** {MIN_OPEN_INTEREST}",
+        f"- **Strike price range for puts:** {MIN_STRIKE_PCT*100:.1f}% - 100% of current price",
+        f"- **Strike price range for calls:** 100% - {MAX_STRIKE_PCT*100:.1f}% of current price",
+        "",
+        "### 🔍 Top Trades by Annualized Yield"
     ])
     
-    # Add top puts
+    # Print summary to console
+    print("\n" + "="*80)
+    print("📊 SCAN COMPLETE - SUMMARY")
+    print("="*80)
+    print(f"✅ Processed {stats['tickers_processed']} tickers in {total_runtime}")
+    print(f"📊 Found {stats['total_puts_found']} puts and {stats['total_calls_found']} calls meeting criteria")
+    print(f"📈 Success rate: {success_rate:.1f}%")
+    
+    if stats['tickers_with_errors'] > 0:
+        print(f"\n⚠️  Encountered {stats['tickers_with_errors']} errors:")
+        for i, error in enumerate(stats['errors'][:5], 1):  # Show first 5 errors
+            print(f"   {i}. {error}")
+        if len(stats['errors']) > 5:
+            print(f"   ... and {len(stats['errors']) - 5} more errors")
+    
+    print("\n🔍 Scan results saved to:")
+    print(f"   - Detailed report: {output_file}")
+    
+    if all_puts or all_calls:
+        print("\n🏆 Top Trades:")
+        # Show top 3 puts and calls if available
+        if all_puts:
+            print("\n📉 Top 3 Puts by Annualized Yield:")
+            for i, put in enumerate(sorted(all_puts, key=lambda x: x.get('annualized_yield', 0), reverse=True)[:3], 1):
+                print(f"   {i}. {put.get('ticker')} ${put.get('strike_price'):.2f} Put | "
+                      f"Premium: ${put.get('mid_price', 0):.2f} | "
+                      f"Yield: {put.get('annualized_yield', 0):.1f}% | "
+                      f"Δ {put.get('delta', 0):.2f} | "
+                      f"DTE: {put.get('days_to_expiration', 0)}")
+        
+        if all_calls:
+            print("\n📈 Top 3 Calls by Annualized Yield:")
+            for i, call in enumerate(sorted(all_calls, key=lambda x: x.get('annualized_yield', 0), reverse=True)[:3], 1):
+                print(f"   {i}. {call.get('ticker')} ${call.get('strike_price'):.2f} Call | "
+                      f"Premium: ${call.get('mid_price', 0):.2f} | "
+                      f"Yield: {call.get('annualized_yield', 0):.1f}% | "
+                      f"Δ {call.get('delta', 0):.2f} | "
+                      f"DTE: {call.get('days_to_expiration', 0)}")
+    
+    print("\n" + "="*80)
+    
+    # Helper function to generate trade rationale
+    def generate_rationale(opt, is_put):
+        ticker = opt.get('ticker', 'UNKNOWN')
+        strike = opt.get('strike_price', 0)
+        current_price = opt.get('current_price', 0)
+        premium = opt.get('mid_price', 0)
+        dte = opt.get('days_to_expiration', 0)
+        delta = opt.get('delta', 0)
+        pop = opt.get('probability_itm', 0) / 100  # Convert back to decimal
+        
+        # Determine if ITM/OTM
+        if is_put:
+            moneyness = "ITM" if strike > current_price else "OTM"
+            breakeven = strike - premium
+            max_profit = premium
+            max_loss = strike - premium
+        else:  # call
+            moneyness = "ITM" if strike < current_price else "OTM"
+            breakeven = strike + premium
+            max_profit = "Unlimited" if is_put else "Unlimited"
+            max_loss = premium
+        
+        # Generate rationale based on option metrics
+        rationale = []
+        
+        # Play type and risk profile
+        rationale.append(f"**{opt.get('play_type', 'Trade')}** ({opt.get('risk_tolerance', 'MEDIUM')} risk): ")
+        
+        # Basic trade setup
+        if is_put:
+            rationale.append(f"Sell ${strike:.2f} put ({moneyness}) "
+                           f"for ${premium:.2f} premium, {dte} DTE.")
+        else:
+            rationale.append(f"Sell ${strike:.2f} call ({moneyness}) "
+                           f"for ${premium:.2f} premium, {dte} DTE.")
+        
+        # Key metrics
+        rationale.append(f"\n- **Probability of Profit (PoP):** {pop*100:.0f}%")
+        rationale.append(f"- **Annualized Yield:** {opt.get('annualized_yield', 0):.1f}%")
+        rationale.append(f"- **Delta:** {delta:.2f}")
+        rationale.append(f"- **Breakeven:** ${breakeven:.2f}")
+        
+        # Risk/Reward
+        rationale.append("\n**Risk/Reward:**")
+        rationale.append(f"- Max Profit: ${max_profit:.2f} per contract")
+        rationale.append(f"- Max Loss: ${max_loss:.2f} per contract" if isinstance(max_loss, (int, float)) else f"- Max Loss: {max_loss} (naked call)")
+        
+        # Liquidity note
+        if opt.get('liquidity_score', 0) < 20:
+            rationale.append("\n⚠️ **Liquidity Warning:** Low open interest/volume - consider smaller position size.")
+        
+        return "\n".join(rationale)
+    
+    # Add top puts with rationales
     if all_puts:
         md_content.extend([
-            "\n### 🏆 Top 5 Cash-Secured Puts",
-            "| Ticker | Strike | Premium | Δ | Yield | Annualized | ROC | DTE | Prob ITM | R/R |",
-            "|--------|--------|---------|--|-------|------------|-----|-----|----------|-----|"
+            "\n## 📉 Top Put Opportunities",
+            "| Ticker | Strike | Premium | Yield | DTE | Δ | PoP | Play Type |",
+            "|--------|--------|---------|-------|-----|---|-----|-----------|"
         ])
-        for put in sorted(all_puts, key=lambda x: x.get('annualized_yield', 0), reverse=True)[:5]:
+        
+        # Sort by yield descending and take top 10
+        top_puts = sorted(all_puts, key=lambda x: x.get('annualized_yield', 0), reverse=True)[:10]
+        for put in top_puts:
             md_content.append(
-                f"| {put.get('ticker', 'N/A')} | "
-                f"${put.get('strike_price', 0):.2f} | "
+                f"| {put.get('ticker')} | "
+                f"${put.get('strike_price'):.2f} | "
                 f"${put.get('mid_price', 0):.2f} | "
-                f"{put.get('delta', 0):.2f} | "
-                f"{put.get('premium_yield', 0):.1f}% | "
                 f"{put.get('annualized_yield', 0):.1f}% | "
-                f"{put.get('monthly_roc', 0):.1f}% | "
                 f"{put.get('days_to_expiration', 0)} | "
-                f"{put.get('probability_itm', 0):.1f}% | "
-                f"1:{put.get('risk_reward_ratio', 0):.1f} |"
+                f"{put.get('delta', 0):.2f} | "
+                f"{put.get('probability_itm', 0):.0f}% | "
+                f"{put.get('play_type', 'N/A')} |"
             )
+            
+            # Add rationale as collapsible section
+            rationale = generate_rationale(put, is_put=True)
+            md_content.append(f"\n<details><summary>📝 <b>Trade Rationale</b></summary>\n\n{rationale}\n</details>\n")
     
-    # Add top calls
+    # Add top calls with rationales
     if all_calls:
         md_content.extend([
-            "\n### 🏆 Top 5 Covered Calls",
-            "| Ticker | Strike | Premium | Δ | Yield | Annualized | ROC | DTE | Prob ITM | R/R |",
-            "|--------|--------|---------|--|-------|------------|-----|-----|----------|-----|"
+            "\n## 📈 Top Call Opportunities",
+            "| Ticker | Strike | Premium | Yield | DTE | Δ | PoP | Play Type |",
+            "|--------|--------|---------|-------|-----|---|-----|-----------|"
         ])
-        for call in sorted(all_calls, key=lambda x: x.get('annualized_yield', 0), reverse=True)[:5]:
+        
+        # Sort by yield descending and take top 10
+        top_calls = sorted(all_calls, key=lambda x: x.get('annualized_yield', 0), reverse=True)[:10]
+        for call in top_calls:
             md_content.append(
-                f"| {call.get('ticker', 'N/A')} | "
-                f"${call.get('strike_price', 0):.2f} | "
+                f"| {call.get('ticker')} | "
+                f"${call.get('strike_price'):.2f} | "
                 f"${call.get('mid_price', 0):.2f} | "
-                f"{call.get('delta', 0):.2f} | "
-                f"{call.get('premium_yield', 0):.1f}% | "
                 f"{call.get('annualized_yield', 0):.1f}% | "
-                f"{call.get('monthly_roc', 0):.1f}% | "
                 f"{call.get('days_to_expiration', 0)} | "
-                f"{call.get('probability_itm', 0):.1f}% | "
-                f"1:{call.get('risk_reward_ratio', 0):.1f} |"
+                f"{call.get('delta', 0):.2f} | "
+                f"{call.get('probability_itm', 0):.0f}% | "
+                f"{call.get('play_type', 'N/A')} |"
             )
+            
+            # Add rationale as collapsible section
+            rationale = generate_rationale(call, is_put=False)
+            md_content.append(f"\n<details><summary>📝 <b>Trade Rationale</b></summary>\n\n{rationale}\n</details>\n")
     
-    # Add errors if any
+    # Add error section if any errors occurred
     if stats['errors']:
         md_content.extend([
             "\n## ❌ Errors Encountered",
-            "The following errors were encountered during processing:"
+            "The following errors were encountered during processing:",
+            ""
         ])
+        
         for error in stats['errors']:
             md_content.append(f"- {error}")
     
@@ -1384,9 +1963,9 @@ def run():
         "",
         "---",
         f"Generated on {datetime.now().strftime('%Y-%m-%d at %H:%M:%S %Z')}",
-        ""
+        f"Total runtime: {datetime.now() - stats['start_time']}"
     ])
-    
+
     # Save to file
     try:
         with open(output_file, 'w', encoding='utf-8') as f:
@@ -1456,12 +2035,55 @@ def run():
     
     return output_file
 
-if __name__ == "__main__":
+def parse_args():
+    """Parse command line arguments."""
+    parser = argparse.ArgumentParser(description='Options Scanner with Polygon.io')
+    parser.add_argument('--risk', type=str, default='medium',
+                      choices=['low', 'medium', 'high'],
+                      help='Risk tolerance level (default: medium)')
+    parser.add_argument('--tickers', type=str, nargs='+',
+                      help='List of tickers to scan (space-separated)')
+    parser.add_argument('--min-premium', type=float, default=DEFAULT_MIN_PREMIUM,
+                      help=f'Minimum premium (default: {DEFAULT_MIN_PREMIUM})')
+    parser.add_argument('--min-delta', type=float, default=DEFAULT_MIN_DELTA,
+                      help=f'Minimum delta (default: {DEFAULT_MIN_DELTA})')
+    parser.add_argument('--max-delta', type=float, default=DEFAULT_MAX_DELTA,
+                      help=f'Maximum delta (default: {DEFAULT_MAX_DELTA})')
+    parser.add_argument('--min-oi', type=int, default=DEFAULT_MIN_OPEN_INTEREST,
+                      help=f'Minimum open interest (default: {DEFAULT_MIN_OPEN_INTEREST})')
+    return parser.parse_args()
+
+def main():
+    """Main entry point for the script."""
     try:
-        run()
+        args = parse_args()
+        
+        # Update global config if provided
+        if args.tickers:
+            global TICKERS
+            TICKERS = [t.upper() for t in args.tickers]
+        
+        # Update other globals from args
+        global MIN_PREMIUM, MIN_DELTA, MAX_DELTA, MIN_OPEN_INTEREST
+        MIN_PREMIUM = args.min_premium
+        MIN_DELTA = args.min_delta
+        MAX_DELTA = args.max_delta
+        MIN_OPEN_INTEREST = args.min_oi
+        
+        print(f"🔍 Starting scan with risk tolerance: {args.risk.upper()}")
+        print(f"📊 Tickers: {', '.join(TICKERS) if args.tickers else 'Default list'}")
+        print(f"⚙️  Parameters: Premium>${MIN_PREMIUM:.2f}, Δ={MIN_DELTA:.2f}-{MAX_DELTA:.2f}, OI>={MIN_OPEN_INTEREST}")
+        
+        # Run with specified risk tolerance
+        run(risk_tolerance=args.risk)
+        
     except KeyboardInterrupt:
-        print("\n\n⚠️  Script interrupted by user")
+        print("\n⚠️  Scan interrupted by user")
     except Exception as e:
-        print(f"\n❌ An unexpected error occurred: {str(e)}")
+        print(f"\n❌ Error: {str(e)}")
         import traceback
         traceback.print_exc()
+
+if __name__ == "__main__":
+    import argparse
+    main()

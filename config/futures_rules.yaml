@@ -1,0 +1,49 @@
+# ====================================================================
+#  Futures Hedge Rules – MBT (Micro-Bitcoin Futures, CME)
+# ====================================================================
+symbol: MBT
+contract: MBTM25             # front-month; adapter will auto-roll later
+
+# ----- global risk guard -------------------------------------------
+position_limit: 30            # hard cap on absolute contracts
+
+# --------------------------------------------------------------------
+#  Tranche definitions
+# --------------------------------------------------------------------
+tranches:
+
+  # --- 10-lot scalp add --------------------------------------------
+  - name: scalp_add
+    qty: 10
+    entry_mode: manual          # adapter detects an open fill >0
+    oco:
+      tp1: 103300               # USD
+      tp2: 102950
+      stop: 104400
+    tif: GTC                    # applies to all OCO legs
+    status: active              # internal state toggle (do not modify)
+
+  # --- 20-lot core runner -----------------------------------------
+  - name: core_runner
+    qty: 20
+    trailing_stop:
+      initial: 105200
+      mode: atr                 # 15-min ATR(14)
+      timeframe: 15m
+      multiplier: 1.0
+      trail_on_new_lows: true
+    hard_targets:
+      - 101700
+      - 99900
+    tif: GTC
+    status: active
+
+# ----- adapter engine params ---------------------------------------
+engine:
+  tick_size: 0.5                # USD
+  poll_sec: 15                  # Ironbeam REST position poll
+  md_ws: "wss://md.ironbeam.com/v1"   # Ironbeam market-data WS
+
+# ----- Ironbeam REST creds pulled from ENV -------------------------
+ironbeam:
+  base: "https://api.ironbeam.com/v1"   # override in ENV if sandbox

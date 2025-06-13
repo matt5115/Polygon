@@ -1,0 +1,26 @@
+# Strategy selection criteria for auto-trading
+# All values must be met for a strategy to be selected
+
+# Minimum net return on investment (%)
+min_net_roi: 2.0
+
+# Maximum drawdown allowed (% of margin)
+max_drawdown: -5.0
+
+# Minimum Sharpe ratio
+min_sharpe: 0.8
+
+# Minimum number of trades for statistical significance
+min_trades: 5
+
+# Maximum commission + slippage as % of PnL
+max_cost_ratio: 0.25  # 25% of PnL can go to costs
+
+# Minimum win rate (%)
+min_win_rate: 40.0
+
+# Minimum profit factor (gross profit / gross loss)
+min_profit_factor: 1.2
+
+# Maximum average loss to average win ratio
+max_loss_to_win_ratio: 0.75

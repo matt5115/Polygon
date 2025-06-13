@@ -1,8 +1,16 @@
+"""Core ORM models (moved from legacy models.py).
+
+Only change from original is swapping local `Base` declaration for
+`from app.db import Base` so all models share a single metadata registry.
+"""
 from datetime import date
 from uuid import uuid4
-from sqlalchemy import Column, String, Float, Date, Enum, Boolean
-from app.db import Base
 import enum
+
+from sqlalchemy import Column, String, Float, Date, Enum, Boolean
+
+from app.db import Base
+
 
 class TradeStatus(str, enum.Enum):
     scanned = "scanned"
@@ -10,10 +18,12 @@ class TradeStatus(str, enum.Enum):
     expired = "expired"
     executed = "executed"
 
+
 class ExecutionSource(str, enum.Enum):
     simulated = "simulated"
     manual = "manual"
     api_live = "api_live"
+
 
 class Trade(Base):
     __tablename__ = "trades"
